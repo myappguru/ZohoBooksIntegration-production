@@ -1,0 +1,6 @@
+/* Layout/color rules moved to inline styles in Footer.jsx - see the comment
+   there. Only the hover state stays here, since pseudo-classes have no
+   inline-style equivalent. */
+.mag-app-footer-content a:hover {
+  text-decoration: none;
+}

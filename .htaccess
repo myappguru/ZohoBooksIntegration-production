@@ -1,0 +1,12 @@
+# Block direct access to source/secrets — the whole project folder is the
+# document root, so nothing here should be servable as a static file.
+<FilesMatch "^(\.env.*|\.git.*|knexfile\.js|package(-lock)?\.json)$">
+  Require all denied
+</FilesMatch>
+
+RewriteEngine On
+RewriteCond %{REQUEST_URI} ^/(\.git|node_modules|database|build)(/|$)
+RewriteRule ^ - [F,L]
+
+# Everything else goes to the Node app.
+RewriteRule ^(.*)$ http://127.0.0.1:4000/$1 [P,L]

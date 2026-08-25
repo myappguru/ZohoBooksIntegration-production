@@ -1,0 +1,42 @@
+{% if block.settings.show_badge %}
+  {{ 'zoho-sync-badge.css' | asset_url | stylesheet_tag }}
+  <div
+    class="zoho-sync-badge"
+    style="--zoho-badge-bg: {{ block.settings.background_color }}; --zoho-badge-color: {{ block.settings.text_color }};"
+  >
+    {{ block.settings.message }}
+  </div>
+{% endif %}
+
+{% schema %}
+{
+  "name": "Zoho Books Sync Badge",
+  "target": "body",
+  "settings": [
+    {
+      "type": "checkbox",
+      "id": "show_badge",
+      "label": "Show badge",
+      "default": true
+    },
+    {
+      "type": "text",
+      "id": "message",
+      "label": "Message",
+      "default": "Synced with Zoho Books"
+    },
+    {
+      "type": "color",
+      "id": "background_color",
+      "label": "Background color",
+      "default": "#0b5fff"
+    },
+    {
+      "type": "color",
+      "id": "text_color",
+      "label": "Text color",
+      "default": "#ffffff"
+    }
+  ]
+}
+{% endschema %}

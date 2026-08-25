@@ -1,0 +1,13 @@
+.zoho-sync-badge {
+  position: fixed;
+  z-index: 999;
+  bottom: 16px;
+  right: 16px;
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.4;
+  background: var(--zoho-badge-bg);
+  color: var(--zoho-badge-color);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+}

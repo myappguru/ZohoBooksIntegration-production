@@ -1,0 +1,9 @@
+/* Everything else this carousel needs (flex row, card border/background/
+   padding, responsive card sizing) is now applied as inline styles from
+   OtherApps.jsx - inline styles can't be silently dropped or overridden by
+   whatever was preventing this stylesheet's rules from taking effect. Only
+   the ::-webkit-scrollbar pseudo-element hiding rule stays here, since
+   pseudo-elements have no inline-style equivalent. */
+.mag-other-apps::-webkit-scrollbar {
+  display: none;
+}
