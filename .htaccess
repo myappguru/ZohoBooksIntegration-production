@@ -4,6 +4,16 @@
   Require all denied
 </FilesMatch>
 
+# Without this, requests to routes that share a name with a real folder here
+# (e.g. /app, matching the app/ source directory) get a 301-to-trailing-slash
+# from mod_dir before the proxy rule below ever runs, breaking those routes.
+DirectorySlash Off
+
+# Without this, a bare "/" request gets silently rewritten to look for
+# index.html in this directory before the proxy rule runs, so Node receives
+# "/index.html" instead of "/" and 404s on it (no such route exists).
+DirectoryIndex disabled
+
 RewriteEngine On
 RewriteCond %{REQUEST_URI} ^/(\.git|node_modules|database|build)(/|$)
 RewriteRule ^ - [F,L]
