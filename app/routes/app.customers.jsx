@@ -43,10 +43,27 @@ function normalizeCustomerPageNode(node) {
     amountSpentCurrency: node.amountSpent?.currencyCode || "USD",
   };
 }
+// async function fetchCustomersPage(admin, { after, before } = {}) {
+//   const variables = before ? { last: PAGE_SIZE, before } : { first: PAGE_SIZE, after: after || null };
+//   const response = await admin.graphql(CUSTOMER_PAGE_QUERY, { variables });
+//   const json = await response.json();
+//   return {
+
 async function fetchCustomersPage(admin, { after, before } = {}) {
   const variables = before ? { last: PAGE_SIZE, before } : { first: PAGE_SIZE, after: after || null };
   const response = await admin.graphql(CUSTOMER_PAGE_QUERY, { variables });
   const json = await response.json();
+
+  console.log("CUSTOMER_DEBUG", JSON.stringify({
+    customers: json.data?.customers?.edges?.map(({ node }) => ({
+      id: node.id,
+      name: `${node.firstName || ""} ${node.lastName || ""}`.trim(),
+      email: node.email,
+    })),
+    errors: json.errors || null,
+    variables,
+  }, null, 2));
+
   return {
     customers: (json.data?.customers?.edges || []).map(({ node }) => normalizeCustomerPageNode(node)),
     pageInfo: json.data?.customers?.pageInfo || { hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null },
@@ -184,7 +201,7 @@ export default function CustomersPage() {
               const mapping = mappings[customer.id];
               const status = !mapping ? "pending" : mapping.status === "error" ? "error" : "synced";
               const label = status === "synced" ? "Synced" : status === "error" ? "Sync error" : "Not synced";
-              return <tr key={customer.id}><td><div className="customer-cell"><span className="avatar">{initials(customer)}</span><div className="customer-main"><a className="customer-name" href={`shopify://admin/customers/${shopifyNumericId(customer.id)}`} target="_top">{fullName(customer)}</a>{customer.tags?.[0] && <span className="customer-tag">{customer.tags[0]}</span>}</div></div></td><td><span className="customer-email">{customer.email || "No email"}</span></td><td>{customer.phone || <span className="muted">—</span>}</td><td className="orders-cell">{formatCount(customer.numberOfOrders)}</td><td className="spent-cell">{formatCurrency(customer.amountSpent, customer.amountSpentCurrency)}</td><td className="status-cell"><span className={`status-badge ${status}`}><span className="status-dot"></span>{label}</span></td><td className="muted">{formatDate(mapping?.lastSyncedAt)}</td><td className="action-cell"><div className="action-wrap"><button className="more-button" type="button" aria-label={`Actions for ${fullName(customer)}`} onClick={() => setOpenMenu((current) => current === customer.id ? null : customer.id)}><span className="more-dots" aria-hidden="true"><span></span><span></span><span></span></span></button>{openMenu === customer.id && <div className="action-menu"><button type="button" onClick={() => setOpenMenu(null)}><a href={`shopify://admin/customers/${shopifyNumericId(customer.id)}`} target="_top" style={{color:"inherit",textDecoration:"none",display:"block"}}>View in Shopify</a></button>{connected && <Form method="post" onSubmit={() => setOpenMenu(null)}><input type="hidden" name="intent" value="sync-customer" /><input type="hidden" name="customerId" value={customer.id} /><button type="submit" disabled={Boolean(syncingCustomerId)}>{syncingCustomerId === customer.id ? "Syncing customer…" : "Sync customer"}</button></Form>}</div>}</div></td></tr>;
+              return <tr key={customer.id}><td><div className="customer-cell"><span className="avatar">{initials(customer)}</span><div className="customer-main"><a className="customer-name" href={`shopify://admin/customers/${shopifyNumericId(customer.id)}`} target="_top">{fullName(customer)}</a>{customer.tags?.[0] && <span className="customer-tag">{customer.tags[0]}</span>}</div></div></td><td><span className="customer-email">{customer.email || "No email"}</span></td><td>{customer.phone || <span className="muted">—</span>}</td><td className="orders-cell">{formatCount(customer.numberOfOrders)}</td><td className="spent-cell">{formatCurrency(customer.amountSpent, customer.amountSpentCurrency)}</td><td className="status-cell"><span className={`status-badge ${status}`}><span className="status-dot"></span>{label}</span></td><td className="muted">{formatDate(mapping?.lastSyncedAt)}</td><td className="action-cell"><div className="action-wrap"><button className="more-button" type="button" aria-label={`Actions for ${fullName(customer)}`} onClick={() => setOpenMenu((current) => current === customer.id ? null : customer.id)}><span className="more-dots" aria-hidden="true"><span></span><span></span><span></span></span></button>{openMenu === customer.id && <div className="action-menu"><button type="button" onClick={() => setOpenMenu(null)}><a href={`shopify://admin/customers/${shopifyNumericId(customer.id)}`} target="_top" style={{ color: "inherit", textDecoration: "none", display: "block" }}>View in Shopify</a></button>{connected && <Form method="post" onSubmit={() => setOpenMenu(null)}><input type="hidden" name="intent" value="sync-customer" /><input type="hidden" name="customerId" value={customer.id} /><button type="submit" disabled={Boolean(syncingCustomerId)}>{syncingCustomerId === customer.id ? "Syncing customer…" : "Sync customer"}</button></Form>}</div>}</div></td></tr>;
             })}
           </tbody></table></div>}
           <div className="pagination"><div className="pagination-summary">Showing {filteredCustomers.length} of {customers.length} customers on this page</div><div className="pagination-actions"><s-button disabled={!pageInfo.hasPreviousPage} href={pageInfo.hasPreviousPage ? `?before=${encodeURIComponent(pageInfo.startCursor)}` : undefined}>Previous</s-button><s-button disabled={!pageInfo.hasNextPage} href={pageInfo.hasNextPage ? `?after=${encodeURIComponent(pageInfo.endCursor)}` : undefined}>Next</s-button></div></div>

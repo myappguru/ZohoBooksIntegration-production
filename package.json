@@ -21,7 +21,8 @@
     "db:status": "knex migrate:status",
     "db:migration": "knex migrate:make",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "cache:clear": "rm -rf node_modules/.vite node_modules/.cache build"
   },
   "type": "module",
   "engines": {

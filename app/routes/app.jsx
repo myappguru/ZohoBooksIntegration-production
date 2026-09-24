@@ -46,6 +46,12 @@ export function ErrorBoundary() {
   return boundary.error(useRouteError());
 }
 
+// export const headers = (headersArgs) => {
+//   return boundary.headers(headersArgs);
+// };
+
 export const headers = (headersArgs) => {
-  return boundary.headers(headersArgs);
+  const headers = boundary.headers(headersArgs);
+  headers.set("Cache-Control", "no-store");
+  return headers;
 };
