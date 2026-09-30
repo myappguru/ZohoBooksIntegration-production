@@ -1,4 +1,5 @@
 import db from "../db.server";
+import { purgeOldWebhookPayloads } from "./compliance.server";
 import { unauthenticated } from "../shopify.server";
 import { processOrderUpsertWebhook } from "./orderSync.server";
 import { processOrderPaidWebhook } from "./paymentSync.server";
@@ -167,8 +168,10 @@ export function startWebhookRetryLoop() {
   if (globalThis.__zohoWebhookRetryLoop) return;
   if (process.env.NODE_ENV === "test" || process.env.DISABLE_WEBHOOK_RETRY === "true") return;
 
-  const run = () =>
+  const run = () => {
     retryFailedWebhooks().catch((error) => console.error("Webhook retry sweep failed", error));
+    purgeOldWebhookPayloads().catch((error) => console.error("Webhook payload purge failed", error));
+  };
   globalThis.__zohoWebhookRetryLoop = setInterval(run, SWEEP_INTERVAL_MS);
   globalThis.__zohoWebhookRetryLoop.unref?.();
   setTimeout(run, 30 * 1000).unref?.();
