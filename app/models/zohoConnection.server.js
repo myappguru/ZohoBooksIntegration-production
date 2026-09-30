@@ -1,6 +1,6 @@
 import db from "../db.server";
 import { ensureShop } from "./shop.server";
-import { refreshAccessToken } from "../zoho.server";
+import { refreshAccessToken, accountsServerForDataCenter, normalizeAccountsServer } from "../zoho.server";
 
 export async function getActiveConnection(shopId) {
   const [rows] = await db.execute(
@@ -25,6 +25,7 @@ export async function saveConnection(shopId, {
   refreshToken,
   apiDomain,
   dataCenter,
+  accountsServer,
   scope,
   accessTokenExpiresAt,
 }) {
@@ -34,14 +35,15 @@ export async function saveConnection(shopId, {
 
   await db.execute(
     `INSERT INTO zoho_connections
-       (shop_id, organization_id, organization_name, access_token, refresh_token, api_domain, data_center, scope, access_token_expires_at, is_active, connected_at, disconnected_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, NOW(), NULL)
+       (shop_id, organization_id, organization_name, access_token, refresh_token, api_domain, data_center, accounts_server, scope, access_token_expires_at, is_active, connected_at, disconnected_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, NOW(), NULL)
      ON DUPLICATE KEY UPDATE
        organization_name = VALUES(organization_name),
        access_token = VALUES(access_token),
        refresh_token = VALUES(refresh_token),
        api_domain = VALUES(api_domain),
        data_center = VALUES(data_center),
+       accounts_server = VALUES(accounts_server),
        scope = VALUES(scope),
        access_token_expires_at = VALUES(access_token_expires_at),
        is_active = TRUE,
@@ -55,6 +57,7 @@ export async function saveConnection(shopId, {
       refreshToken,
       apiDomain || null,
       dataCenter || null,
+      normalizeAccountsServer(accountsServer),
       scope || null,
       accessTokenExpiresAt || null,
     ]
@@ -96,9 +99,11 @@ export async function getValidAccessToken(shopId) {
   }
 
   // Refresh must target the same data center the connection was created on
-  // (accounts.zoho.com/.in/.eu/...) - derived from the stored data_center
-  // column since a merchant's account can be on any Zoho region.
-  const accountsServer = connection.data_center ? `https://accounts.zoho.${connection.data_center}` : undefined;
+  // (accounts.zoho.com/.in/.eu/zohocloud.ca/...). Prefer the accounts host
+  // recorded at connect time; older rows fall back to data_center.
+  const accountsServer =
+    normalizeAccountsServer(connection.accounts_server) ||
+    accountsServerForDataCenter(connection.data_center);
   const refreshed = await refreshAccessToken(connection.refresh_token, accountsServer);
   const accessTokenExpiresAt = new Date(Date.now() + refreshed.expires_in * 1000);
 

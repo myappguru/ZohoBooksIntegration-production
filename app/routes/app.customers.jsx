@@ -54,15 +54,7 @@ async function fetchCustomersPage(admin, { after, before } = {}) {
   const response = await admin.graphql(CUSTOMER_PAGE_QUERY, { variables });
   const json = await response.json();
 
-  console.log("CUSTOMER_DEBUG", JSON.stringify({
-    customers: json.data?.customers?.edges?.map(({ node }) => ({
-      id: node.id,
-      name: `${node.firstName || ""} ${node.lastName || ""}`.trim(),
-      email: node.email,
-    })),
-    errors: json.errors || null,
-    variables,
-  }, null, 2));
+  if (json.errors) console.error("Failed to load Shopify customers page", json.errors);
 
   return {
     customers: (json.data?.customers?.edges || []).map(({ node }) => normalizeCustomerPageNode(node)),

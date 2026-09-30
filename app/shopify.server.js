@@ -15,7 +15,7 @@ const shopify = shopifyApp({
   appUrl: process.env.SHOPIFY_APP_URL || "",
   authPathPrefix: "/auth",
   sessionStorage: new MySQLSessionStorage(
-  `mysql://${process.env.DB_USERNAME}:${process.env.DB_PASSWORD}@${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_DATABASE}`),
+  `mysql://${encodeURIComponent(process.env.DB_USERNAME || "")}:${encodeURIComponent(process.env.DB_PASSWORD || "")}@${process.env.DB_HOST}:${process.env.DB_PORT}/${encodeURIComponent(process.env.DB_DATABASE || "")}`),
   distribution: AppDistribution.AppStore,
   future: {
     expiringOfflineAccessTokens: true,

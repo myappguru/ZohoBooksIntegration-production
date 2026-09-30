@@ -22,7 +22,40 @@ export class ZohoApiError extends Error {
 }
 
 function getStateSecret() {
-  return process.env.SHOPIFY_API_SECRET || "zoho-oauth-state-secret";
+  const secret = process.env.SHOPIFY_API_SECRET;
+  // Never fall back to a public constant: anyone could then forge a state
+  // for any shop domain.
+  if (!secret) {
+    throw new Error("SHOPIFY_API_SECRET must be set to sign Zoho OAuth state");
+  }
+  return secret;
+}
+
+// Zoho accounts servers per data center. The callback's `accounts-server`
+// param is attacker-controllable, and we POST the client secret to it, so
+// only these exact hosts are ever accepted.
+const ZOHO_ACCOUNTS_HOST_PATTERN =
+  /^accounts\.(zoho\.(com|eu|in|com\.au|jp|sa|uk|com\.cn)|zohocloud\.ca)$/;
+
+export function normalizeAccountsServer(value) {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.port || url.username || url.password) return null;
+    if (url.pathname !== "/" && url.pathname !== "") return null;
+    if (!ZOHO_ACCOUNTS_HOST_PATTERN.test(url.hostname)) return null;
+    return `https://${url.hostname}`;
+  } catch {
+    return null;
+  }
+}
+
+// Fallback for connections saved before accounts_server was stored.
+// Canada is the odd one out: its accounts host is zohocloud.ca, not zoho.ca.
+export function accountsServerForDataCenter(dataCenter) {
+  if (!dataCenter) return undefined;
+  if (dataCenter === "ca") return "https://accounts.zohocloud.ca";
+  return normalizeAccountsServer(`https://accounts.zoho.${dataCenter}`) || undefined;
 }
 
 // Signs {shop, nonce, ts} so the OAuth callback can trust the shop domain
@@ -43,10 +76,13 @@ export function createOAuthState(shopDomain) {
   return `${json}.${signature}`;
 }
 
+// Returns the signed {shop, nonce, ts} payload, or null if the state is
+// forged, malformed or expired.
 export function verifyOAuthState(state) {
-  if (!state || !state.includes(".")) return null;
+  if (typeof state !== "string" || !state.includes(".")) return null;
 
   const [json, signature] = state.split(".");
+  if (!json || !signature) return null;
   const expectedSignature = crypto
     .createHmac("sha256", getStateSecret())
     .update(json)
@@ -62,13 +98,19 @@ export function verifyOAuthState(state) {
     return null;
   }
 
-  const payload = JSON.parse(Buffer.from(json, "base64url").toString("utf8"));
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(json, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
 
+  if (!payload?.shop || !payload?.nonce || typeof payload.ts !== "number") return null;
   if (Date.now() - payload.ts > STATE_TTL_MS) {
     return null;
   }
 
-  return payload.shop;
+  return payload;
 }
 
 export function getAuthorizationUrl(shopDomain) {
@@ -95,6 +137,9 @@ export async function exchangeCodeForToken(
   code,
   accountsServer = ZOHO_ACCOUNTS_URL,
 ) {
+  if (accountsServer !== ZOHO_ACCOUNTS_URL && !normalizeAccountsServer(accountsServer)) {
+    throw new ZohoApiError("Refusing to exchange a Zoho code with an untrusted accounts server", { accountsServer });
+  }
   const params = new URLSearchParams({
     grant_type: "authorization_code",
     client_id: ZOHO_CLIENT_ID,
@@ -125,6 +170,9 @@ export async function refreshAccessToken(
   refreshToken,
   accountsServer = ZOHO_ACCOUNTS_URL,
 ) {
+  if (accountsServer !== ZOHO_ACCOUNTS_URL && !normalizeAccountsServer(accountsServer)) {
+    throw new ZohoApiError("Refusing to refresh a Zoho token with an untrusted accounts server", { accountsServer });
+  }
   const params = new URLSearchParams({
     grant_type: "refresh_token",
     client_id: ZOHO_CLIENT_ID,

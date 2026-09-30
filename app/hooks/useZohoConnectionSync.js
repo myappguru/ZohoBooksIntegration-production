@@ -1,15 +1,45 @@
 import { useEffect, useRef } from "react";
-import { useRevalidator } from "react-router";
+import { useFetcher, useRevalidator } from "react-router";
+
+function toast(message, isError = false) {
+  try {
+    window.shopify?.toast?.show(message, { isError });
+  } catch {
+    // App Bridge not ready - the page still revalidates below.
+  }
+}
 
 export function useZohoConnectionSync() {
   const revalidator = useRevalidator();
   const revalidatorRef = useRef(revalidator);
   revalidatorRef.current = revalidator;
+  const connectFetcher = useFetcher();
+  const connectFetcherRef = useRef(connectFetcher);
+  connectFetcherRef.current = connectFetcher;
+
+  // The OAuth popup hands the authorization code back to this window; the
+  // authenticated /app/zoho-connect action completes the exchange.
+  useEffect(() => {
+    if (connectFetcher.state !== "idle" || !connectFetcher.data) return;
+    if (connectFetcher.data.ok) {
+      toast(`Connected to Zoho Books${connectFetcher.data.organizationName ? ` (${connectFetcher.data.organizationName})` : ""}`);
+    } else {
+      toast(connectFetcher.data.error || "Failed to connect Zoho Books", true);
+    }
+  }, [connectFetcher.state, connectFetcher.data]);
 
   useEffect(() => {
     function handleMessage(event) {
       if (event.origin !== window.location.origin) return;
       if (event.data?.source !== "zoho-oauth") return;
+      if (event.data.type === "authorization-code") {
+        const { code, state, accountsServer } = event.data;
+        if (typeof code !== "string" || typeof state !== "string") return;
+        const formData = { code, state };
+        if (typeof accountsServer === "string" && accountsServer) formData.accountsServer = accountsServer;
+        connectFetcherRef.current.submit(formData, { method: "post", action: "/app/zoho-connect" });
+        return;
+      }
       revalidatorRef.current.revalidate();
     }
 
@@ -155,7 +185,7 @@ export function useZohoConnectionSync() {
     return () => {
       document.removeEventListener("click", handleTaxClick, true);
       document.removeEventListener("change", handleTaxChange, true);
-      window.removeEventListener("message", handleMessage, true);
+      window.removeEventListener("message", handleMessage);
       style?.remove();
     };
   }, []);
