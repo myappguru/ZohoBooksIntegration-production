@@ -55,23 +55,26 @@ export async function getCustomerMappings(shopId) {
 
 export async function getCustomerMapping(shopId, shopifyCustomerId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
+    `SELECT shopify_id, zoho_id, created_by_app FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
     [shopId, ENTITY_TYPE, shopifyCustomerId],
   );
 
   return rows[0] || null;
 }
 
+// `createdByApp`: true = this app created the Zoho contact, false = linked
+// a contact that already existed (by email), null = leave as stored.
 export async function saveCustomerMapping(
   shopId,
   shopifyCustomerId,
   zohoContactId,
+  createdByApp = null,
 ) {
   await db.execute(
-    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, zoho_id, status, last_synced_at, last_error)
-     VALUES (?, ?, ?, ?, 'synced', NOW(), NULL)
-     ON DUPLICATE KEY UPDATE zoho_id = VALUES(zoho_id), status = 'synced', last_synced_at = NOW(), last_error = NULL`,
-    [shopId, ENTITY_TYPE, shopifyCustomerId, zohoContactId],
+    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, zoho_id, created_by_app, status, last_synced_at, last_error)
+     VALUES (?, ?, ?, ?, ?, 'synced', NOW(), NULL)
+     ON DUPLICATE KEY UPDATE zoho_id = VALUES(zoho_id), created_by_app = COALESCE(VALUES(created_by_app), created_by_app), status = 'synced', last_synced_at = NOW(), last_error = NULL`,
+    [shopId, ENTITY_TYPE, shopifyCustomerId, zohoContactId, createdByApp],
   );
 }
 
@@ -181,6 +184,7 @@ async function syncCustomerToZohoUnlocked({
 
   try {
     let zohoContactId = existingMapping?.zohoId;
+    let createdByApp = null;
 
     if (zohoContactId) {
       await updateZohoContact(zohoAuth, zohoContactId, payload);
@@ -191,14 +195,16 @@ async function syncCustomerToZohoUnlocked({
       });
       if (existingContact) {
         zohoContactId = existingContact.contact_id;
+        createdByApp = false;
         await updateZohoContact(zohoAuth, zohoContactId, payload);
       } else {
         const created = await createZohoContact(zohoAuth, payload);
         zohoContactId = created.contact_id;
+        createdByApp = true;
       }
     }
 
-    await saveCustomerMapping(shopId, customer.id, zohoContactId);
+    await saveCustomerMapping(shopId, customer.id, zohoContactId, createdByApp);
 
     return { email: customer.email, zohoContactId, status: "success" };
   } catch (error) {
@@ -419,6 +425,10 @@ export async function syncCustomerDeletionToZoho({
   if (!mapping) return { status: "skipped" };
 
   try {
+    // Contacts that existed in Zoho before this app linked them (or whose
+    // origin wasn't tracked) are the merchant's own records - deactivate
+    // only. Only contacts this app created are deleted.
+    if (Number(mapping.created_by_app) !== 1) throw new Error("not created by this app - deactivate only");
     await deleteZohoContact(zohoAuth, mapping.zoho_id);
     await deleteCustomerMapping(shopId, shopifyCustomerId);
     return { zohoContactId: mapping.zoho_id, status: "deleted" };

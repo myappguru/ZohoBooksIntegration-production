@@ -66,22 +66,27 @@ export async function getProductMappings(shopId) {
 // GID) is stored so a later products/delete webhook - which only gives us
 // the product's id, none of its variants' - can still find every mapping
 // row that belongs to it.
+// `createdByApp` is true when this app created the Zoho item, false when it
+// linked an item that already existed in Zoho, and null to leave the
+// stored value alone (plain re-sync of an existing mapping).
 export async function saveProductMapping(
   shopId,
   shopifyVariantId,
   zohoItemId,
   shopifyParentId,
+  createdByApp = null,
 ) {
   await db.execute(
-    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, shopify_parent_id, zoho_id, status, last_synced_at, last_error)
-     VALUES (?, ?, ?, ?, ?, 'synced', NOW(), NULL)
-     ON DUPLICATE KEY UPDATE zoho_id = VALUES(zoho_id), shopify_parent_id = VALUES(shopify_parent_id), status = 'synced', last_synced_at = NOW(), last_error = NULL`,
+    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, shopify_parent_id, zoho_id, created_by_app, status, last_synced_at, last_error)
+     VALUES (?, ?, ?, ?, ?, ?, 'synced', NOW(), NULL)
+     ON DUPLICATE KEY UPDATE zoho_id = VALUES(zoho_id), shopify_parent_id = VALUES(shopify_parent_id), created_by_app = COALESCE(VALUES(created_by_app), created_by_app), status = 'synced', last_synced_at = NOW(), last_error = NULL`,
     [
       shopId,
       ENTITY_TYPE,
       shopifyVariantId,
       shopifyParentId || null,
       zohoItemId,
+      createdByApp,
     ],
   );
 }
@@ -111,7 +116,7 @@ export async function getProductMapping(shopId, shopifyVariantId) {
 
 export async function getProductMappingsByParentId(shopId, shopifyParentId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_parent_id = ?`,
+    `SELECT shopify_id, zoho_id, created_by_app FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_parent_id = ?`,
     [shopId, ENTITY_TYPE, shopifyParentId],
   );
 
@@ -247,6 +252,7 @@ async function syncVariantToZohoUnlocked({
 
   try {
     let zohoItemId = existingMapping?.zohoId;
+    let createdByApp = null;
 
     if (zohoItemId) {
       await updateZohoItem(zohoAuth, zohoItemId, payload);
@@ -257,10 +263,12 @@ async function syncVariantToZohoUnlocked({
       });
       if (existingItem) {
         zohoItemId = existingItem.item_id;
+        createdByApp = false;
         await updateZohoItem(zohoAuth, zohoItemId, payload);
       } else {
         const created = await createZohoItem(zohoAuth, payload);
         zohoItemId = created.item_id;
+        createdByApp = true;
       }
     }
 
@@ -269,7 +277,7 @@ async function syncVariantToZohoUnlocked({
       zohoItemId,
       product.status === "ACTIVE",
     );
-    await saveProductMapping(shopId, variant.id, zohoItemId, product.id);
+    await saveProductMapping(shopId, variant.id, zohoItemId, product.id, createdByApp);
 
     if (inventoryAccountId) {
       await denyOversellForVariant(admin, product, variant);
@@ -571,13 +579,18 @@ export async function processProductUpsertWebhook({
       mappings,
       inventoryAccountId: appSettings.accountSettings?.inventoryAccountId,
     });
+    // REST product payloads list at most 100 variants; with more than that
+    // we can't tell a removed variant from an omitted one, so skip cleanup.
+    if (product.variants.length > 0 && product.variants.length < 100) {
+      results.push(...(await retireRemovedVariants({ shopId: shop.id, zohoAuth, product })));
+    }
     const failed = results.filter((result) => result.status === "error");
 
     await finishWebhookLog(logId, {
       status: failed.length > 0 ? "failed" : "processed",
       errorMessage:
         failed.length > 0
-          ? failed.map((result) => `${result.sku}: ${result.error}`).join("; ")
+          ? failed.map((result) => `${result.sku || result.zohoItemId}: ${result.error}`).join("; ")
           : null,
     });
   } catch (error) {
@@ -589,14 +602,43 @@ export async function processProductUpsertWebhook({
   }
 }
 
-// For each Zoho item mapped to this (now-deleted) Shopify product: try a
+// For each Zoho item mapped to this (now-deleted) Shopify product. Items
+// this app did NOT create (linked to a pre-existing Zoho item by SKU, or
+// mapped before that was tracked) belong to the merchant's own catalog, so
+// they are only deactivated, never deleted. Items the app created get a
 // hard delete first, but Zoho refuses to delete an item that's been used
-// in any transaction (invoice, bill, etc.) - so fall back to deactivating
-// it instead, which preserves that transaction history. The mapping row
+// in any transaction (invoice, bill, etc.) - so that falls back to
+// deactivating it, which preserves that transaction history. The mapping row
 // is removed either way (the Shopify side is gone regardless); if BOTH
 // the delete and the deactivate attempt fail, the row is kept with
 // status "error" instead, so the failure stays visible rather than
 // silently vanishing.
+// Retires one variant's Zoho item after the variant (or its whole product)
+// is gone from Shopify. The mapping row is removed either way; if neither
+// delete nor deactivate works it is kept with status "error" so the
+// failure stays visible.
+async function retireZohoItemMapping({ shopId, zohoAuth, mapping }) {
+  if (Number(mapping.created_by_app) === 1) {
+    try {
+      await deleteZohoItem(zohoAuth, mapping.zoho_id);
+      await deleteProductMapping(shopId, mapping.shopify_id);
+      return { zohoItemId: mapping.zoho_id, status: "deleted" };
+    } catch {
+      // Used in a transaction - Zoho won't delete it; deactivate below.
+    }
+  }
+
+  try {
+    await setZohoItemActiveStatus(zohoAuth, mapping.zoho_id, false);
+    await deleteProductMapping(shopId, mapping.shopify_id);
+    return { zohoItemId: mapping.zoho_id, status: "deactivated" };
+  } catch (deactivateError) {
+    console.error("Failed to delete or deactivate Zoho item", mapping.zoho_id, deactivateError);
+    await markProductMappingError(shopId, mapping.shopify_id, deactivateError.message);
+    return { zohoItemId: mapping.zoho_id, status: "error", error: deactivateError.message };
+  }
+}
+
 export async function syncProductDeletionToZoho({
   shopId,
   zohoAuth,
@@ -606,33 +648,24 @@ export async function syncProductDeletionToZoho({
   const results = [];
 
   for (const mapping of mappings) {
-    try {
-      await deleteZohoItem(zohoAuth, mapping.zoho_id);
-      await deleteProductMapping(shopId, mapping.shopify_id);
-      results.push({ zohoItemId: mapping.zoho_id, status: "deleted" });
-    } catch (deleteError) {
-      try {
-        await setZohoItemActiveStatus(zohoAuth, mapping.zoho_id, false);
-        await deleteProductMapping(shopId, mapping.shopify_id);
-        results.push({ zohoItemId: mapping.zoho_id, status: "deactivated" });
-      } catch (deactivateError) {
-        console.error(
-          "Failed to delete or deactivate Zoho item for deleted product",
-          mapping.zoho_id,
-          deactivateError,
-        );
-        await markProductMappingError(
-          shopId,
-          mapping.shopify_id,
-          deactivateError.message,
-        );
-        results.push({
-          zohoItemId: mapping.zoho_id,
-          status: "error",
-          error: deactivateError.message,
-        });
-      }
-    }
+    results.push(await retireZohoItemMapping({ shopId, zohoAuth, mapping }));
+  }
+
+  return results;
+}
+
+// A variant removed from a product arrives as a products/update without
+// that variant - retire its Zoho item the same way a product delete would,
+// instead of leaving it mapped and active forever.
+export async function retireRemovedVariants({ shopId, zohoAuth, product }) {
+  if (!product?.id || !Array.isArray(product.variants)) return [];
+  const currentIds = new Set(product.variants.map((variant) => variant.id));
+  const mappings = await getProductMappingsByParentId(shopId, product.id);
+  const results = [];
+
+  for (const mapping of mappings) {
+    if (currentIds.has(mapping.shopify_id)) continue;
+    results.push(await retireZohoItemMapping({ shopId, zohoAuth, mapping }));
   }
 
   return results;
