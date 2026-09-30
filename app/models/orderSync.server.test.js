@@ -180,10 +180,16 @@ describe("buildOrderCustomer", () => {
     expect(customer.address.address1).toBe("1 Main St");
   });
 
-  it("returns a null id when there's no customer and no email at all", () => {
+  it("uses the shared walk-in contact when there's no customer, email or phone (e.g. POS sale)", () => {
     const customer = buildOrderCustomer({});
-    expect(customer.id).toBeNull();
+    expect(customer.id).toBe("guest:walk-in");
     expect(customer.email).toBeNull();
+  });
+
+  it("keys a phone-only guest checkout on the phone number", () => {
+    const customer = buildOrderCustomer({ phone: "+91 98765 43210", billingAddress: { firstName: "Asha" } });
+    expect(customer.id).toBe("guest-phone:+919876543210");
+    expect(customer.firstName).toBe("Asha");
   });
 });
 

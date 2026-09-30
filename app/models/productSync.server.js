@@ -14,6 +14,7 @@ import { recordWebhookReceived, finishWebhookLog } from "./webhookLog.server";
 import { getAppSettings } from "./appSettings.server";
 import { startSyncLog, finishSyncLog } from "./syncLog.server";
 import { withResourceLock, resourceLockKey } from "./resourceLock.server";
+import { payloadHash } from "./payloadHash.server";
 
 const ENTITY_TYPE = "product";
 
@@ -42,7 +43,7 @@ export async function getSyncedProductCount(shopId) {
 
 export async function getProductMappings(shopId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id, status, last_synced_at, last_error FROM sync_mappings WHERE shop_id = ? AND entity_type = ?`,
+    `SELECT shopify_id, zoho_id, payload_hash, status, last_synced_at, last_error FROM sync_mappings WHERE shop_id = ? AND entity_type = ?`,
     [shopId, ENTITY_TYPE],
   );
 
@@ -51,6 +52,7 @@ export async function getProductMappings(shopId) {
       row.shopify_id,
       {
         zohoId: row.zoho_id || null,
+        payloadHash: row.payload_hash || null,
         status: row.status,
         lastSyncedAt: row.last_synced_at,
         lastError: row.last_error,
@@ -75,11 +77,12 @@ export async function saveProductMapping(
   zohoItemId,
   shopifyParentId,
   createdByApp = null,
+  hash = null,
 ) {
   await db.execute(
-    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, shopify_parent_id, zoho_id, created_by_app, status, last_synced_at, last_error)
-     VALUES (?, ?, ?, ?, ?, ?, 'synced', NOW(), NULL)
-     ON DUPLICATE KEY UPDATE zoho_id = VALUES(zoho_id), shopify_parent_id = VALUES(shopify_parent_id), created_by_app = COALESCE(VALUES(created_by_app), created_by_app), status = 'synced', last_synced_at = NOW(), last_error = NULL`,
+    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, shopify_parent_id, zoho_id, created_by_app, payload_hash, status, last_synced_at, last_error)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'synced', NOW(), NULL)
+     ON DUPLICATE KEY UPDATE zoho_id = VALUES(zoho_id), shopify_parent_id = VALUES(shopify_parent_id), created_by_app = COALESCE(VALUES(created_by_app), created_by_app), payload_hash = COALESCE(VALUES(payload_hash), payload_hash), status = 'synced', last_synced_at = NOW(), last_error = NULL`,
     [
       shopId,
       ENTITY_TYPE,
@@ -87,6 +90,7 @@ export async function saveProductMapping(
       shopifyParentId || null,
       zohoItemId,
       createdByApp,
+      hash,
     ],
   );
 }
@@ -110,7 +114,7 @@ export async function markProductMappingError(
 
 export async function getProductMapping(shopId, shopifyVariantId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ? AND zoho_id <> ''`,
+    `SELECT shopify_id, zoho_id, payload_hash, status FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ? AND zoho_id <> ''`,
     [shopId, ENTITY_TYPE, shopifyVariantId],
   );
 
@@ -229,7 +233,7 @@ export async function syncVariantToZoho(args) {
   return withResourceLock(resourceLockKey(shopId, "product-sku", variant.sku), async () => {
     const fresh = await getProductMapping(shopId, variant.id);
     const freshMappings = { ...(mappings || {}) };
-    if (fresh) freshMappings[variant.id] = { ...(freshMappings[variant.id] || {}), zohoId: fresh.zoho_id };
+    if (fresh) freshMappings[variant.id] = { ...(freshMappings[variant.id] || {}), zohoId: fresh.zoho_id, payloadHash: fresh.payload_hash, status: fresh.status };
     else delete freshMappings[variant.id];
 
     const result = await syncVariantToZohoUnlocked({ ...args, mappings: freshMappings });
@@ -252,6 +256,12 @@ async function syncVariantToZohoUnlocked({
 
   const payload = buildZohoItemPayload(product, variant, { inventoryAccountId });
   const existingMapping = mappings[variant.id];
+  // products/update also fires for inventory and metafield changes; skip
+  // the item PUT + status POST + Shopify mutation when nothing we send changed.
+  const hash = payloadHash({ payload, active: product.status === "ACTIVE", parent: product.id || null });
+  if (existingMapping?.zohoId && existingMapping.payloadHash === hash && existingMapping.status === "synced") {
+    return { sku: variant.sku, zohoItemId: existingMapping.zohoId, status: "success", unchanged: true };
+  }
 
   try {
     let zohoItemId = existingMapping?.zohoId;
@@ -280,7 +290,7 @@ async function syncVariantToZohoUnlocked({
       zohoItemId,
       product.status === "ACTIVE",
     );
-    await saveProductMapping(shopId, variant.id, zohoItemId, product.id, createdByApp);
+    await saveProductMapping(shopId, variant.id, zohoItemId, product.id, createdByApp, hash);
 
     if (inventoryAccountId) {
       await denyOversellForVariant(admin, product, variant);

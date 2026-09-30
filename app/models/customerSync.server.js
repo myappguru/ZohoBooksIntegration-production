@@ -13,6 +13,7 @@ import {
 import { recordWebhookReceived, finishWebhookLog } from "./webhookLog.server";
 import { startSyncLog, finishSyncLog } from "./syncLog.server";
 import { withResourceLock, resourceLockKey } from "./resourceLock.server";
+import { payloadHash } from "./payloadHash.server";
 
 const ENTITY_TYPE = "customer";
 
@@ -36,7 +37,7 @@ export async function getSyncedCustomerCount(shopId) {
 
 export async function getCustomerMappings(shopId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id, status, last_synced_at, last_error FROM sync_mappings WHERE shop_id = ? AND entity_type = ?`,
+    `SELECT shopify_id, zoho_id, payload_hash, status, last_synced_at, last_error FROM sync_mappings WHERE shop_id = ? AND entity_type = ?`,
     [shopId, ENTITY_TYPE],
   );
 
@@ -45,6 +46,7 @@ export async function getCustomerMappings(shopId) {
       row.shopify_id,
       {
         zohoId: row.zoho_id || null,
+        payloadHash: row.payload_hash || null,
         status: row.status,
         lastSyncedAt: row.last_synced_at,
         lastError: row.last_error,
@@ -55,7 +57,7 @@ export async function getCustomerMappings(shopId) {
 
 export async function getCustomerMapping(shopId, shopifyCustomerId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id, created_by_app FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ? AND zoho_id <> ''`,
+    `SELECT shopify_id, zoho_id, created_by_app, payload_hash, status FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ? AND zoho_id <> ''`,
     [shopId, ENTITY_TYPE, shopifyCustomerId],
   );
 
@@ -69,12 +71,13 @@ export async function saveCustomerMapping(
   shopifyCustomerId,
   zohoContactId,
   createdByApp = null,
+  hash = null,
 ) {
   await db.execute(
-    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, zoho_id, created_by_app, status, last_synced_at, last_error)
-     VALUES (?, ?, ?, ?, ?, 'synced', NOW(), NULL)
-     ON DUPLICATE KEY UPDATE zoho_id = VALUES(zoho_id), created_by_app = COALESCE(VALUES(created_by_app), created_by_app), status = 'synced', last_synced_at = NOW(), last_error = NULL`,
-    [shopId, ENTITY_TYPE, shopifyCustomerId, zohoContactId, createdByApp],
+    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, zoho_id, created_by_app, payload_hash, status, last_synced_at, last_error)
+     VALUES (?, ?, ?, ?, ?, ?, 'synced', NOW(), NULL)
+     ON DUPLICATE KEY UPDATE zoho_id = VALUES(zoho_id), created_by_app = COALESCE(VALUES(created_by_app), created_by_app), payload_hash = COALESCE(VALUES(payload_hash), payload_hash), status = 'synced', last_synced_at = NOW(), last_error = NULL`,
+    [shopId, ENTITY_TYPE, shopifyCustomerId, zohoContactId, createdByApp, hash],
   );
 }
 
@@ -105,7 +108,7 @@ export function buildZohoContactPayload(customer) {
   const firstName = customer.firstName || "";
   const lastName = customer.lastName || "";
   const contactName =
-    `${firstName} ${lastName}`.trim() || customer.email || "Unnamed customer";
+    `${firstName} ${lastName}`.trim() || customer.email || customer.phone || "Unnamed customer";
   const address = customer.address || {};
   const phone = customer.phone || address.phone || "";
 
@@ -127,7 +130,7 @@ export function buildZohoContactPayload(customer) {
       {
         first_name: firstName,
         last_name: lastName,
-        email: customer.email,
+        ...(customer.email ? { email: customer.email } : {}),
         phone,
         is_primary_contact: true,
       },
@@ -135,6 +138,24 @@ export function buildZohoContactPayload(customer) {
     billing_address: zohoAddress,
     shipping_address: zohoAddress,
   };
+}
+
+// Zoho requires contact_name to be unique per organization, so a second
+// "John Smith" with a different email used to fail. On a duplicate-name
+// rejection, retry once with the email/phone appended to the name.
+function isDuplicateContactNameError(error) {
+  const message = String(error.details?.message || "");
+  return error.details?.code === 3062 || /already exists/i.test(message);
+}
+
+async function createContactWithUniqueName(zohoAuth, payload, customer) {
+  try {
+    return await createZohoContact(zohoAuth, payload);
+  } catch (error) {
+    const disambiguator = customer.email || customer.phone;
+    if (!disambiguator || !isDuplicateContactNameError(error)) throw error;
+    return createZohoContact(zohoAuth, { ...payload, contact_name: `${payload.contact_name} (${disambiguator})` });
+  }
 }
 
 // `customer` is { id, firstName, lastName, email, phone, address } - the
@@ -153,16 +174,22 @@ export async function syncCustomerToZoho({
   customer,
   mappings,
 }) {
-  if (!customer.email) {
-    return { email: customer.email, status: "skipped" };
+  // Phone-only customers have no email to match on, so they sync purely by
+  // their mapping key (Shopify customer id / guest-phone key).
+  if (!customer.email && !customer.id) {
+    return { email: customer.email, status: "skipped", reason: "customer has no email or id" };
   }
 
+  const lockKey = customer.email
+    ? resourceLockKey(shopId, "customer-email", customer.email.toLowerCase())
+    : resourceLockKey(shopId, "customer", customer.id);
+
   return withResourceLock(
-    resourceLockKey(shopId, "customer-email", customer.email.toLowerCase()),
+    lockKey,
     async () => {
       const fresh = customer.id ? await getCustomerMapping(shopId, customer.id) : null;
       const freshMappings = { ...(mappings || {}) };
-      if (fresh) freshMappings[customer.id] = { ...(freshMappings[customer.id] || {}), zohoId: fresh.zoho_id };
+      if (fresh) freshMappings[customer.id] = { ...(freshMappings[customer.id] || {}), zohoId: fresh.zoho_id, payloadHash: fresh.payload_hash, status: fresh.status };
       else delete freshMappings[customer.id];
 
       const result = await syncCustomerToZohoUnlocked({ shopId, zohoAuth, customer, mappings: freshMappings });
@@ -183,6 +210,10 @@ async function syncCustomerToZohoUnlocked({
 
   const payload = buildZohoContactPayload(customer);
   const existingMapping = mappings[customer.id];
+  const hash = payloadHash(payload);
+  if (existingMapping?.zohoId && existingMapping.payloadHash === hash && existingMapping.status === "synced") {
+    return { email: customer.email, zohoContactId: existingMapping.zohoId, status: "success", unchanged: true };
+  }
 
   try {
     let zohoContactId = existingMapping?.zohoId;
@@ -191,22 +222,21 @@ async function syncCustomerToZohoUnlocked({
     if (zohoContactId) {
       await updateZohoContact(zohoAuth, zohoContactId, payload);
     } else {
-      const existingContact = await fetchZohoContactByEmail({
-        ...zohoAuth,
-        email: customer.email,
-      });
+      const existingContact = customer.email
+        ? await fetchZohoContactByEmail({ ...zohoAuth, email: customer.email })
+        : null;
       if (existingContact) {
         zohoContactId = existingContact.contact_id;
         createdByApp = false;
         await updateZohoContact(zohoAuth, zohoContactId, payload);
       } else {
-        const created = await createZohoContact(zohoAuth, payload);
+        const created = await createContactWithUniqueName(zohoAuth, payload, customer);
         zohoContactId = created.contact_id;
         createdByApp = true;
       }
     }
 
-    await saveCustomerMapping(shopId, customer.id, zohoContactId, createdByApp);
+    await saveCustomerMapping(shopId, customer.id, zohoContactId, createdByApp, hash);
 
     return { email: customer.email, zohoContactId, status: "success" };
   } catch (error) {

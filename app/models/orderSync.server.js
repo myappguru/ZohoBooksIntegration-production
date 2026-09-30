@@ -14,6 +14,7 @@ import { syncCustomerToZoho, getCustomerMappings } from "./customerSync.server";
 import { recordWebhookReceived, finishWebhookLog } from "./webhookLog.server";
 import { startSyncLog, finishSyncLog } from "./syncLog.server";
 import { withResourceLock, resourceLockKey } from "./resourceLock.server";
+import { payloadHash } from "./payloadHash.server";
 
 const ENTITY_TYPE = "order";
 
@@ -37,7 +38,7 @@ function describeZohoError(error) {
 
 export async function getOrderMappings(shopId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id, status, last_synced_at, last_error FROM sync_mappings WHERE shop_id = ? AND entity_type = ?`,
+    `SELECT shopify_id, zoho_id, payload_hash, status, last_synced_at, last_error FROM sync_mappings WHERE shop_id = ? AND entity_type = ?`,
     [shopId, ENTITY_TYPE],
   );
 
@@ -46,6 +47,7 @@ export async function getOrderMappings(shopId) {
       row.shopify_id,
       {
         zohoId: row.zoho_id || null,
+        payloadHash: row.payload_hash || null,
         status: row.status,
         lastSyncedAt: row.last_synced_at,
         lastError: row.last_error,
@@ -56,19 +58,29 @@ export async function getOrderMappings(shopId) {
 
 export async function getOrderMapping(shopId, shopifyOrderId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ? AND zoho_id <> ''`,
+    `SELECT shopify_id, zoho_id, payload_hash, status FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ? AND zoho_id <> ''`,
     [shopId, ENTITY_TYPE, shopifyOrderId],
   );
 
   return rows[0] || null;
 }
 
-export async function saveOrderMapping(shopId, shopifyOrderId, zohoSalesOrderId) {
+export async function saveOrderMapping(shopId, shopifyOrderId, zohoSalesOrderId, hash = null) {
   await db.execute(
-    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, zoho_id, status, last_synced_at, last_error)
-     VALUES (?, ?, ?, ?, 'synced', NOW(), NULL)
-     ON DUPLICATE KEY UPDATE zoho_id = VALUES(zoho_id), status = 'synced', last_synced_at = NOW(), last_error = NULL`,
-    [shopId, ENTITY_TYPE, shopifyOrderId, zohoSalesOrderId],
+    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, zoho_id, payload_hash, status, last_synced_at, last_error)
+     VALUES (?, ?, ?, ?, ?, 'synced', NOW(), NULL)
+     ON DUPLICATE KEY UPDATE zoho_id = VALUES(zoho_id), payload_hash = COALESCE(VALUES(payload_hash), payload_hash), status = 'synced', last_synced_at = NOW(), last_error = NULL`,
+    [shopId, ENTITY_TYPE, shopifyOrderId, zohoSalesOrderId, hash],
+  );
+}
+
+// The order changed in Shopify after its Zoho sales order was invoiced -
+// Zoho locks invoiced sales orders (36023), so the change can't be applied.
+// Flagged instead of reported as a successful sync.
+export async function markOrderMappingOutOfSync(shopId, shopifyOrderId, message) {
+  await db.execute(
+    `UPDATE sync_mappings SET status = 'out_of_sync', last_synced_at = NOW(), last_error = ? WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
+    [message, shopId, ENTITY_TYPE, shopifyOrderId],
   );
 }
 
@@ -93,15 +105,21 @@ export async function markOrderMappingVoided(shopId, shopifyOrderId) {
 // account) still carry an email/billing address on the order itself, so a
 // synthetic id ("guest:<email>") is used as the sync_mappings key - this
 // keeps repeat orders from the same guest email linking to the one Zoho
-// contact instead of creating a duplicate every time.
+// contact instead of creating a duplicate every time. Orders with no email
+// (phone-only checkouts, POS walk-in sales) used to be skipped entirely;
+// they now key on the phone number, or share a single "Walk-in customer"
+// contact when there's nothing to identify the buyer at all.
 export function buildOrderCustomer(order) {
   if (order.customer) return order.customer;
 
   const billing = order.billingAddress || {};
-  if (!order.email) return { id: null, email: null };
+  const phone = order.phone || billing.phone || "";
+  if (!order.email && !phone) {
+    return { id: "guest:walk-in", firstName: "Walk-in", lastName: "customer", email: null, phone: "", address: {} };
+  }
 
   return {
-    id: `guest:${order.email}`,
+    id: order.email ? `guest:${order.email}` : `guest-phone:${phone.replace(/\s+/g, "")}`,
     firstName: billing.firstName || "",
     lastName: billing.lastName || "",
     email: order.email,
@@ -338,9 +356,16 @@ export async function syncOrderToZoho(args) {
 
   return withResourceLock(resourceLockKey(shopId, ENTITY_TYPE, order.id), async () => {
     const fresh = await getOrderMapping(shopId, order.id);
+    if (fresh?.status === "voided") {
+      // Cancelled and voided in Zoho - the orders/updated that Shopify sends
+      // with every cancellation (and later "Sync now" runs) must not
+      // resurrect it or overwrite the voided status.
+      return { orderName: order.name, zohoSalesOrderId: fresh.zoho_id, status: "skipped", reason: "order is voided in Zoho" };
+    }
     const freshMappings = { ...(orderMappings || {}) };
-    if (fresh) freshMappings[order.id] = { ...(freshMappings[order.id] || {}), zohoId: fresh.zoho_id };
-    else delete freshMappings[order.id];
+    if (fresh) {
+      freshMappings[order.id] = { ...(freshMappings[order.id] || {}), zohoId: fresh.zoho_id, payloadHash: fresh.payload_hash, status: fresh.status };
+    } else delete freshMappings[order.id];
 
     const result = await syncOrderToZohoUnlocked({ ...args, orderMappings: freshMappings });
     if (result.status === "success" && orderMappings) {
@@ -362,8 +387,8 @@ async function syncOrderToZohoUnlocked({
   inventoryAccountId,
 }) {
   const customer = buildOrderCustomer(order);
-  if (!customer.email) {
-    return { orderName: order.name, status: "skipped" };
+  if (!customer.id && !customer.email) {
+    return { orderName: order.name, status: "skipped", reason: "order has no customer to invoice" };
   }
 
   const customerResult = await syncCustomerToZoho({
@@ -402,6 +427,12 @@ async function syncOrderToZohoUnlocked({
     taxSettings,
   });
   const existingMapping = orderMappings[order.id];
+  const hash = payloadHash(payload);
+
+  // Nothing changed since the last successful push - skip the Zoho call.
+  if (existingMapping?.zohoId && existingMapping.payloadHash === hash && existingMapping.status === "synced") {
+    return { orderName: order.name, zohoSalesOrderId: existingMapping.zohoId, status: "success", unchanged: true };
+  }
 
   try {
     let zohoSalesOrderId = existingMapping?.zohoId;
@@ -413,7 +444,7 @@ async function syncOrderToZohoUnlocked({
       zohoSalesOrderId = created.salesorder_id;
     }
 
-    await saveOrderMapping(shopId, order.id, zohoSalesOrderId);
+    await saveOrderMapping(shopId, order.id, zohoSalesOrderId, hash);
 
     return { orderName: order.name, zohoSalesOrderId, status: "success" };
   } catch (error) {
@@ -421,9 +452,18 @@ async function syncOrderToZohoUnlocked({
     // been invoiced (error 36023) - that's an expected terminal state once
     // Section E has run, not a real sync failure, so the existing mapping
     // is left as-is (still "synced") rather than overwritten with "error".
+    // The payload differs from what was last pushed (checked above), so
+    // this is a real edit that Zoho won't take - flag it for the merchant
+    // rather than report success. A mapping without a stored hash predates
+    // change tracking; adopt the current payload as the baseline instead.
     if (existingMapping?.zohoId && error.details?.code === 36023) {
-      await saveOrderMapping(shopId, order.id, existingMapping.zohoId);
-      return { orderName: order.name, zohoSalesOrderId: existingMapping.zohoId, status: "success" };
+      if (!existingMapping.payloadHash) {
+        await saveOrderMapping(shopId, order.id, existingMapping.zohoId, hash);
+        return { orderName: order.name, zohoSalesOrderId: existingMapping.zohoId, status: "success" };
+      }
+      const message = "Order changed in Shopify after it was invoiced in Zoho; Zoho locks invoiced sales orders, so update the invoice in Zoho manually.";
+      await markOrderMappingOutOfSync(shopId, order.id, message);
+      return { orderName: order.name, zohoSalesOrderId: existingMapping.zohoId, status: "warning", error: message };
     }
 
     // Zoho rejects a `tax_id` on ANY line item, org-wide, if GST hasn't been
@@ -454,7 +494,7 @@ async function syncOrderToZohoUnlocked({
           zohoSalesOrderId = created.salesorder_id;
         }
 
-        await saveOrderMapping(shopId, order.id, zohoSalesOrderId);
+        await saveOrderMapping(shopId, order.id, zohoSalesOrderId, hash);
 
         return { orderName: order.name, zohoSalesOrderId, status: "success" };
       } catch (retryError) {
@@ -1057,7 +1097,7 @@ export async function processOrderUpsertWebhook({
 
     await finishWebhookLog(logId, {
       status: result.status === "error" ? "failed" : "processed",
-      errorMessage: result.status === "error" ? result.error : null,
+      errorMessage: result.status === "error" || result.status === "warning" ? result.error : result.reason || null,
     });
   } catch (error) {
     console.error("Failed to process order webhook", topic, error);
