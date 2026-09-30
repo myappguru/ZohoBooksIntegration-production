@@ -13,6 +13,7 @@ import { syncVariantToZoho, getProductMappings } from "./productSync.server";
 import { syncCustomerToZoho, getCustomerMappings } from "./customerSync.server";
 import { recordWebhookReceived, finishWebhookLog } from "./webhookLog.server";
 import { startSyncLog, finishSyncLog } from "./syncLog.server";
+import { withResourceLock, resourceLockKey } from "./resourceLock.server";
 
 const ENTITY_TYPE = "order";
 
@@ -292,7 +293,30 @@ async function resolveOrderLineItems({ shopId, admin, zohoAuth, order, productMa
 // only through an order webhook, never through product sync) doesn't get
 // the policy enforced immediately - it still will next time a product sync
 // touches that variant.
-export async function syncOrderToZoho({
+//
+// Serialized per order: orders/create, orders/paid (via invoice sync) and
+// orders/updated arrive within about a second of each other, and without
+// the lock each would create its own Zoho sales order. The mapping is
+// re-read inside the lock, and the caller's `orderMappings` snapshot is
+// updated so later steps in the same request see the new sales order.
+export async function syncOrderToZoho(args) {
+  const { shopId, order, orderMappings } = args;
+
+  return withResourceLock(resourceLockKey(shopId, ENTITY_TYPE, order.id), async () => {
+    const fresh = await getOrderMapping(shopId, order.id);
+    const freshMappings = { ...(orderMappings || {}) };
+    if (fresh) freshMappings[order.id] = { ...(freshMappings[order.id] || {}), zohoId: fresh.zoho_id };
+    else delete freshMappings[order.id];
+
+    const result = await syncOrderToZohoUnlocked({ ...args, orderMappings: freshMappings });
+    if (result.status === "success" && orderMappings) {
+      orderMappings[order.id] = { ...(orderMappings[order.id] || {}), zohoId: result.zohoSalesOrderId, status: "synced" };
+    }
+    return result;
+  });
+}
+
+async function syncOrderToZohoUnlocked({
   shopId,
   admin,
   zohoAuth,

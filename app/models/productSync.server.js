@@ -13,6 +13,7 @@ import {
 import { recordWebhookReceived, finishWebhookLog } from "./webhookLog.server";
 import { getAppSettings } from "./appSettings.server";
 import { startSyncLog, finishSyncLog } from "./syncLog.server";
+import { withResourceLock, resourceLockKey } from "./resourceLock.server";
 
 const ENTITY_TYPE = "product";
 
@@ -97,6 +98,15 @@ export async function markProductMappingError(
     `UPDATE sync_mappings SET status = 'error', last_error = ? WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
     [errorMessage, shopId, ENTITY_TYPE, shopifyVariantId],
   );
+}
+
+export async function getProductMapping(shopId, shopifyVariantId) {
+  const [rows] = await db.execute(
+    `SELECT shopify_id, zoho_id FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
+    [shopId, ENTITY_TYPE, shopifyVariantId],
+  );
+
+  return rows[0] || null;
 }
 
 export async function getProductMappingsByParentId(shopId, shopifyParentId) {
@@ -197,7 +207,32 @@ async function denyOversellForVariant(admin, product, variant) {
 // webhook payload (see the products.create/update webhook routes).
 // `admin` is optional - only needed to also enforce oversell prevention
 // (see denyOversellForVariant); the Zoho-side sync itself doesn't need it.
-export async function syncVariantToZoho({
+//
+// Serialized per SKU (Zoho items are matched by SKU) so products/create +
+// products/update + an order webhook seeing the same new variant can't each
+// create their own Zoho item. The mapping is re-read inside the lock and
+// the caller's `mappings` snapshot is updated afterwards.
+export async function syncVariantToZoho(args) {
+  const { shopId, variant, mappings } = args;
+  if (!variant.sku) {
+    return { sku: variant.sku, status: "skipped" };
+  }
+
+  return withResourceLock(resourceLockKey(shopId, "product-sku", variant.sku), async () => {
+    const fresh = await getProductMapping(shopId, variant.id);
+    const freshMappings = { ...(mappings || {}) };
+    if (fresh) freshMappings[variant.id] = { ...(freshMappings[variant.id] || {}), zohoId: fresh.zoho_id };
+    else delete freshMappings[variant.id];
+
+    const result = await syncVariantToZohoUnlocked({ ...args, mappings: freshMappings });
+    if (result.status === "success" && mappings) {
+      mappings[variant.id] = { ...(mappings[variant.id] || {}), zohoId: result.zohoItemId, status: "synced" };
+    }
+    return result;
+  });
+}
+
+async function syncVariantToZohoUnlocked({
   shopId,
   admin,
   zohoAuth,
@@ -206,9 +241,6 @@ export async function syncVariantToZoho({
   mappings,
   inventoryAccountId,
 }) {
-  if (!variant.sku) {
-    return { sku: variant.sku, status: "skipped" };
-  }
 
   const payload = buildZohoItemPayload(product, variant, { inventoryAccountId });
   const existingMapping = mappings[variant.id];

@@ -12,6 +12,7 @@ import {
 } from "./zohoConnection.server";
 import { recordWebhookReceived, finishWebhookLog } from "./webhookLog.server";
 import { startSyncLog, finishSyncLog } from "./syncLog.server";
+import { withResourceLock, resourceLockKey } from "./resourceLock.server";
 
 const ENTITY_TYPE = "customer";
 
@@ -135,6 +136,12 @@ export function buildZohoContactPayload(customer) {
 // same shape whether it came from the Admin GraphQL customers query or was
 // normalized from a REST webhook payload (see the customers.create/update
 // webhook routes).
+//
+// Serialized per email (Zoho contacts are matched by email) so concurrent
+// customers/create + customers/update + orders/* webhooks can't each create
+// their own contact. The mapping is re-read inside the lock, and the
+// caller's `mappings` snapshot is updated so later steps in the same
+// request (e.g. payment sync) see a contact created here.
 export async function syncCustomerToZoho({
   shopId,
   zohoAuth,
@@ -144,6 +151,30 @@ export async function syncCustomerToZoho({
   if (!customer.email) {
     return { email: customer.email, status: "skipped" };
   }
+
+  return withResourceLock(
+    resourceLockKey(shopId, "customer-email", customer.email.toLowerCase()),
+    async () => {
+      const fresh = customer.id ? await getCustomerMapping(shopId, customer.id) : null;
+      const freshMappings = { ...(mappings || {}) };
+      if (fresh) freshMappings[customer.id] = { ...(freshMappings[customer.id] || {}), zohoId: fresh.zoho_id };
+      else delete freshMappings[customer.id];
+
+      const result = await syncCustomerToZohoUnlocked({ shopId, zohoAuth, customer, mappings: freshMappings });
+      if (result.status === "success" && mappings && customer.id) {
+        mappings[customer.id] = { ...(mappings[customer.id] || {}), zohoId: result.zohoContactId, status: "synced" };
+      }
+      return result;
+    },
+  );
+}
+
+async function syncCustomerToZohoUnlocked({
+  shopId,
+  zohoAuth,
+  customer,
+  mappings,
+}) {
 
   const payload = buildZohoContactPayload(customer);
   const existingMapping = mappings[customer.id];

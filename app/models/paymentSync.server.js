@@ -6,7 +6,7 @@ import {
 } from "./zohoConnection.server";
 import { getAppSettings } from "./appSettings.server";
 import { getProductMappings } from "./productSync.server";
-import { getCustomerMappings } from "./customerSync.server";
+import { getCustomerMappings, getCustomerMapping } from "./customerSync.server";
 import {
   getOrderMappings,
   normalizeRestOrder,
@@ -14,6 +14,7 @@ import {
 } from "./orderSync.server";
 import { syncInvoiceForOrder } from "./invoiceSync.server";
 import { recordWebhookReceived, finishWebhookLog } from "./webhookLog.server";
+import { withResourceLock, resourceLockKey } from "./resourceLock.server";
 
 const ENTITY_TYPE = "payment";
 
@@ -104,7 +105,14 @@ export function buildZohoPaymentPayload(order, { customerId, invoiceId, accountI
 // same call. Like invoice sync, this is one-shot - once an order has a
 // payment mapping, it's left alone rather than re-synced, since a recorded
 // payment is a finished accounting event, not something to keep updating.
-export async function syncPaymentForOrder({
+// Serialized per order so concurrent deliveries can't record it twice.
+export async function syncPaymentForOrder(args) {
+  return withResourceLock(resourceLockKey(args.shopId, ENTITY_TYPE, args.order.id), () =>
+    syncPaymentForOrderUnlocked(args),
+  );
+}
+
+async function syncPaymentForOrderUnlocked({
   shopId,
   zohoAuth,
   order,
@@ -175,7 +183,14 @@ export async function syncInvoiceAndPaymentForOrder({
     return { invoice: invoiceResult, payment: { orderName: order.name, status: "skipped" } };
   }
 
-  const customerId = customerMappings[buildOrderCustomer(order).id]?.zohoId;
+  // Prefer the customer Zoho put on the invoice itself. The customer
+  // snapshot was loaded before this call and misses a contact created
+  // during it (first-time customers), which used to skip the payment.
+  const orderCustomerId = buildOrderCustomer(order).id;
+  const customerId =
+    invoiceResult.zohoCustomerId ||
+    customerMappings[orderCustomerId]?.zohoId ||
+    (orderCustomerId ? (await getCustomerMapping(shopId, orderCustomerId))?.zoho_id : null);
 
   const paymentResult = await syncPaymentForOrder({
     shopId,
