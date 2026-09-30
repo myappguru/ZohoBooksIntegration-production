@@ -1,11 +1,12 @@
 import { authenticate } from "../shopify.server";
-import { processProductUpsertWebhook } from "../models/productSync.server";
+import { enqueueWebhook } from "../models/webhookQueue.server";
 
+// Acknowledged immediately and processed in the background: Shopify gives a
+// webhook 5 seconds, and syncing to Zoho can take many sequential calls.
 export const action = async ({ request }) => {
-  const { shop, topic, webhookId, payload, admin } =
-    await authenticate.webhook(request);
+  const { shop, topic, webhookId, payload, admin } = await authenticate.webhook(request);
 
-  await processProductUpsertWebhook({ shop, topic, webhookId, payload, admin });
+  enqueueWebhook({ shop, topic, webhookId, payload, admin });
 
   return new Response();
 };
