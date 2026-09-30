@@ -1,6 +1,7 @@
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { Form, useLoaderData, useNavigation } from "react-router";
 import { authenticate } from "../shopify.server";
+import { useRevalidateWhileRunning } from "../hooks/useRevalidateWhileRunning";
 import { getConnectionForShopDomain, getValidAccessToken } from "../models/zohoConnection.server";
 import { getAuthorizationUrl } from "../zoho.server";
 import { getSyncedProductCount, runProductSync } from "../models/productSync.server";
@@ -9,6 +10,7 @@ import { getSyncedOrderCount, runOrderSync } from "../models/orderSync.server";
 import { getSyncedWebhookCount } from "../models/webhookLog.server";
 import { runInventoryPull } from "../models/inventorySync.server";
 import { getLatestSyncLog } from "../models/syncLog.server";
+import { startSyncJob } from "../models/syncJobs.server";
 import OtherApps from "../components/Common/OtherApps";
 import { useZohoConnectionSync } from "../hooks/useZohoConnectionSync";
 
@@ -38,8 +40,9 @@ export const loader = async ({ request }) => {
   return {
     shopDomain: session.shop,
     zohoConnected: Boolean(connection),
+    zohoNeedsReauth: Boolean(connection?.needs_reauth),
     zohoOrganizationName: connection?.organization_name || null,
-    zohoAuthUrl: connection ? null : getAuthorizationUrl(session.shop),
+    zohoAuthUrl: connection && !connection.needs_reauth ? null : getAuthorizationUrl(session.shop),
     syncCounts: { products: productCount, customers: customerCount, orders: orderCount, inventory: inventoryCount },
     recentLogs: { products: productLog, customers: customerLog, orders: orderLog, inventory: inventoryLog },
   };
@@ -57,11 +60,14 @@ export const action = async ({ request }) => {
   });
   if (!token) return null;
   const zohoAuth = { accessToken: token.accessToken, apiDomain: token.apiDomain, organizationId: connection.organization_id };
-  await runProductSync({ admin, shop, zohoAuth });
-  await runCustomerSync({ admin, shop, zohoAuth });
-  await runOrderSync({ admin, shop, zohoAuth });
-  await runInventoryPull({ admin, shop, zohoAuth });
-  return null;
+  // Runs in the background - a full sync can take far longer than a request.
+  const job = startSyncJob(shop.id, "sync-all", async () => {
+    await runProductSync({ admin, shop, zohoAuth });
+    await runCustomerSync({ admin, shop, zohoAuth });
+    await runOrderSync({ admin, shop, zohoAuth });
+    await runInventoryPull({ admin, shop, zohoAuth });
+  });
+  return { ok: true, started: job.started, message: job.started ? "Sync started. Results appear here as each step finishes." : "A sync is already running." };
 };
 
 function openZohoAuthWindow(zohoAuthUrl) {
@@ -93,7 +99,8 @@ function formatDuration(log) {
 }
 
 export default function Index() {
-  const { zohoConnected, zohoOrganizationName, zohoAuthUrl, syncCounts, recentLogs } = useLoaderData();
+  const { zohoConnected, zohoNeedsReauth, zohoOrganizationName, zohoAuthUrl, syncCounts, recentLogs } = useLoaderData();
+  useRevalidateWhileRunning(Object.values(recentLogs || {}));
   useZohoConnectionSync();
   const navigation = useNavigation();
   const isRefreshing = navigation.state === "loading";
@@ -190,8 +197,8 @@ export default function Index() {
 
         <div className="connection-card">
           <div className="connection-side"><div className="connection-logo"><s-icon type="store" tone="success"></s-icon></div><div><div className="connection-name">Shopify</div><div className="connection-caption">Store connected and ready to sync</div></div></div>
-          <div className="connection-center"><span className="connection-line"></span><span className="connected-pill"><span className="connected-dot"></span>{zohoConnected ? "Connected" : "Zoho not connected"}</span><span className="connection-line"></span></div>
-          <div className="connection-side right"><div className="connection-right"><strong>{zohoConnected ? "Zoho Books" : "Connect Zoho Books"}</strong><span>{zohoConnected ? (zohoOrganizationName || "Organization connected") : "Authorize your Zoho organization to enable sync"}</span>{!zohoConnected && <div style={{ marginTop: 6 }}><s-button variant="primary" onClick={() => openZohoAuthWindow(zohoAuthUrl)}>Connect</s-button></div>}</div><div className="connection-logo zoho"><s-icon type="link" tone={zohoConnected ? "info" : "caution"}></s-icon></div></div>
+          <div className="connection-center"><span className="connection-line"></span><span className="connected-pill"><span className="connected-dot"></span>{zohoNeedsReauth ? "Reconnect Zoho" : zohoConnected ? "Connected" : "Zoho not connected"}</span><span className="connection-line"></span></div>
+          <div className="connection-side right"><div className="connection-right"><strong>{zohoConnected ? "Zoho Books" : "Connect Zoho Books"}</strong><span>{zohoNeedsReauth ? "Zoho access expired or was revoked - reconnect to resume syncing" : zohoConnected ? (zohoOrganizationName || "Organization connected") : "Authorize your Zoho organization to enable sync"}</span>{(!zohoConnected || zohoNeedsReauth) && <div style={{ marginTop: 6 }}><s-button variant="primary" onClick={() => openZohoAuthWindow(zohoAuthUrl)}>{zohoNeedsReauth ? "Reconnect" : "Connect"}</s-button></div>}</div><div className="connection-logo zoho"><s-icon type="link" tone={zohoConnected ? "info" : "caution"}></s-icon></div></div>
         </div>
 
         <div className="two-column">

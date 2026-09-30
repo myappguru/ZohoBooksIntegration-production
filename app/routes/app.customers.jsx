@@ -1,6 +1,8 @@
 import { useMemo, useState } from "react";
 import { Form, useActionData, useLoaderData, useNavigation } from "react-router";
 import { authenticate } from "../shopify.server";
+import { useRevalidateWhileRunning } from "../hooks/useRevalidateWhileRunning";
+import { startSyncJob } from "../models/syncJobs.server";
 import { useAutoDismiss } from "../hooks/useAutoDismiss";
 import { getCustomerMappings, normalizeCustomerNode, runCustomerSync, syncCustomerToZoho } from "../models/customerSync.server";
 import { getConnectionForShopDomain, getValidAccessToken } from "../models/zohoConnection.server";
@@ -88,8 +90,8 @@ export const action = async ({ request }) => {
   const zohoAuth = { accessToken: token.accessToken, apiDomain: token.apiDomain, organizationId: connection.organization_id };
 
   if (intent === "sync-now") {
-    const result = await runCustomerSync({ admin, shop, zohoAuth });
-    return { ok: true, type: "bulk", result, message: `${result.success} customers synced successfully${result.failed ? `, ${result.failed} failed` : ""}.` };
+    const job = startSyncJob(shop.id, "customers", () => runCustomerSync({ admin, shop, zohoAuth }));
+    return { ok: true, type: "bulk", message: job.started ? "Customer sync started. Refresh to see results when it finishes." : "A customer sync is already running." };
   }
   if (intent === "sync-customer") {
     const customerId = formData.get("customerId");
@@ -113,6 +115,7 @@ function initials(customer) { const parts = fullName(customer).replace(/[()]/g, 
 
 export default function CustomersPage() {
   const { connected, customers, pageInfo, mappings, latestLog } = useLoaderData();
+  useRevalidateWhileRunning(latestLog);
   const actionData = useActionData();
   const navigation = useNavigation();
   const [search, setSearch] = useState("");

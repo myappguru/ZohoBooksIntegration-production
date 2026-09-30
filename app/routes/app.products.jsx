@@ -1,6 +1,8 @@
 import { useMemo, useState } from "react";
 import { Form, useLoaderData, useNavigation } from "react-router";
 import { authenticate } from "../shopify.server";
+import { useRevalidateWhileRunning } from "../hooks/useRevalidateWhileRunning";
+import { startSyncJob } from "../models/syncJobs.server";
 import { useAutoDismiss } from "../hooks/useAutoDismiss";
 import { getConnectionForShopDomain, getValidAccessToken } from "../models/zohoConnection.server";
 import { getAppSettings } from "../models/appSettings.server";
@@ -39,7 +41,7 @@ export const action = async ({ request }) => {
   const token = await getValidAccessToken(shop.id).catch((error) => { console.error("Failed to get a valid Zoho access token", error); return null; });
   if (!token) return null;
   const zohoAuth = { accessToken: token.accessToken, apiDomain: token.apiDomain, organizationId: connection.organization_id };
-  if (intent === "sync-now") { await runProductSync({ admin, shop, zohoAuth }); return null; }
+  if (intent === "sync-now") { const job = startSyncJob(shop.id, "products", () => runProductSync({ admin, shop, zohoAuth })); return { ok: true, started: job.started }; }
   if (intent === "sync-product") {
     const productId = formData.get("productId");
     if (!productId) return null;
@@ -60,6 +62,7 @@ function getVariantSummary(product) { const variants = product.variants || []; r
 
 export default function ProductsPage() {
   const { connected, products, pageInfo, mappings, latestLog } = useLoaderData();
+  useRevalidateWhileRunning(latestLog);
   const navigation = useNavigation();
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");

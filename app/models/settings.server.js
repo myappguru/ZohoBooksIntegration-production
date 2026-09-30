@@ -79,7 +79,7 @@ export const loader = async ({ request }) => {
   const locations = (locationsJson.data?.locations?.edges || []).map(({ node }) => node);
   return {
     shopDomain: session.shop,
-    connection: connection ? { organizationId: connection.organization_id, organizationName: connection.organization_name, dataCenter: connection.data_center, connectedAt: connection.connected_at, tokenExpiresAt: connection.access_token_expires_at, tokenMasked: token?.accessToken ? `zoho${"•".repeat(28)}${token.accessToken.slice(-4)}` : "zoho••••••••••••••••••••••••••••••••", hasToken: Boolean(token?.accessToken), connectedBy: connection.connected_by || "Zoho Books account", scope: connection.scope || null } : null,
+    connection: connection ? { organizationId: connection.organization_id, organizationName: connection.organization_name, dataCenter: connection.data_center, connectedAt: connection.connected_at, tokenExpiresAt: connection.access_token_expires_at, tokenMasked: token?.accessToken ? `zoho${"•".repeat(28)}${token.accessToken.slice(-4)}` : "zoho••••••••••••••••••••••••••••••••", hasToken: Boolean(token?.accessToken), needsReauth: Boolean(connection.needs_reauth), lastAuthError: connection.last_auth_error || null, connectedBy: connection.connected_by || "Zoho Books account", scope: connection.scope || null } : null,
     organization, syncPreferences, locations, locationsError: Boolean(locationsJson.errors) && locations.length === 0,
     warehouses: warehousesResult.items, warehouseMappings, warehouseSyncError: warehousesResult.error,
     taxes: taxesResult.items, taxSyncError: taxesResult.error, taxSettings, taxRateRows, taxRates: taxRateRows,

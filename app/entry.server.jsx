@@ -5,9 +5,15 @@ import { createReadableStreamFromReadable } from "@react-router/node";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
 import { startWebhookRetryLoop } from "./models/webhookQueue.server";
+import { failInterruptedSyncLogs } from "./models/syncJobs.server";
 
 // Replays failed webhook deliveries in the background (see webhookQueue.server.js).
 startWebhookRetryLoop();
+// Sync runs left "running" by a previous process can never finish now.
+if (!globalThis.__zohoSyncLogsRecovered) {
+  globalThis.__zohoSyncLogsRecovered = true;
+  failInterruptedSyncLogs().catch((error) => console.error("Failed to recover interrupted sync logs", error));
+}
 
 export const streamTimeout = 5000;
 

@@ -1,13 +1,15 @@
 import { useState } from "react";
 import { Form, useLoaderData, useNavigation } from "react-router";
 import { authenticate } from "../shopify.server";
+import { useRevalidateWhileRunning } from "../hooks/useRevalidateWhileRunning";
+import { startSyncJob } from "../models/syncJobs.server";
 import { getConnectionForShopDomain, getValidAccessToken } from "../models/zohoConnection.server";
 import { getSyncHistoryAll, getSyncHistoryStats, reconcilePayments } from "../models/reportingSync.server";
 import { getLatestSyncLog } from "../models/syncLog.server";
 import { getSyncedWebhookCount } from "../models/webhookLog.server";
 
 export const loader = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
+  const { session } = await authenticate.admin(request);
   const { shop, connection } = await getConnectionForShopDomain(session.shop);
   const url = new URL(request.url);
   const search = url.searchParams.get("search") || "";
@@ -43,8 +45,9 @@ export const action = async ({ request }) => {
   if (!connection) return null;
   const token = await getValidAccessToken(shop.id).catch((error) => { console.error("Failed to get a valid Zoho access token for reconciliation", error); return null; });
   if (!token) return null;
-  await reconcilePayments({ shopId: shop.id, admin, zohoAuth: { accessToken: token.accessToken, apiDomain: token.apiDomain, organizationId: connection.organization_id } });
-  return null;
+  const zohoAuth = { accessToken: token.accessToken, apiDomain: token.apiDomain, organizationId: connection.organization_id };
+  const job = startSyncJob(shop.id, "reconciliation", () => reconcilePayments({ shopId: shop.id, admin, zohoAuth }));
+  return { ok: true, started: job.started };
 };
 
 function number(value) { return new Intl.NumberFormat().format(Number(value || 0)); }
@@ -62,6 +65,7 @@ function StatCard({ label, value, caption, icon, tone, accent }) { return <div c
 
 export default function SyncHistoryPage() {
   const data = useLoaderData();
+  useRevalidateWhileRunning([data.latestReconciliationLog, ...(data.history?.rows || [])]);
   const navigation = useNavigation();
   const [storeOpen, setStoreOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);

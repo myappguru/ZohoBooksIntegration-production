@@ -13,6 +13,70 @@ const ZOHO_SCOPES = [
 
 const STATE_TTL_MS = 15 * 60 * 1000;
 
+const MAX_ZOHO_RETRIES = 3;
+const RETRYABLE_SERVER_STATUSES = new Set([500, 502, 503, 504]);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function retryDelayMs(response, attempt) {
+  const retryAfter = Number(response?.headers?.get?.("retry-after"));
+  const base = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 1000 * 2 ** attempt;
+  return Math.min(base, 15000) + Math.floor(Math.random() * 250);
+}
+
+// Every Zoho call goes through here:
+// - 429 (Zoho's per-minute limit) is retried with backoff for any method,
+//   since the request was rejected, not processed.
+// - 5xx and network errors are retried only for idempotent methods
+//   (GET/PUT/DELETE) - a POST that timed out may already have created a
+//   record, and retrying it would create a duplicate.
+// - The returned response's .json() never throws. Zoho answers some
+//   429/5xx with HTML or an empty body; those become a structured error
+//   ({ code: -1, http_status, message, body }) so callers' existing
+//   `!response.ok || data.code !== 0` checks report the real cause.
+export async function zohoFetch(url, options = {}) {
+  const method = (options.method || "GET").toUpperCase();
+  const idempotent = method !== "POST";
+
+  for (let attempt = 0; ; attempt += 1) {
+    let response;
+    try {
+      response = await fetch(url, options);
+    } catch (error) {
+      if (idempotent && attempt < MAX_ZOHO_RETRIES) {
+        await sleep(retryDelayMs(null, attempt));
+        continue;
+      }
+      throw new ZohoApiError(`Could not reach Zoho (${method})`, { code: -1, message: error.message });
+    }
+
+    const retryable =
+      response.status === 429 || (idempotent && RETRYABLE_SERVER_STATUSES.has(response.status));
+    if (retryable && attempt < MAX_ZOHO_RETRIES) {
+      await sleep(retryDelayMs(response, attempt));
+      continue;
+    }
+
+    const text = await response.text();
+    return {
+      ok: response.ok,
+      status: response.status,
+      headers: response.headers,
+      json: async () => {
+        try {
+          return text ? JSON.parse(text) : { code: -1, http_status: response.status, message: "Empty response from Zoho" };
+        } catch {
+          return {
+            code: -1,
+            http_status: response.status,
+            message: `Zoho returned a non-JSON response (HTTP ${response.status})`,
+            body: text.slice(0, 500),
+          };
+        }
+      },
+    };
+  }
+}
+
 export class ZohoApiError extends Error {
   constructor(message, details) {
     super(message);
@@ -148,7 +212,7 @@ export async function exchangeCodeForToken(
     code,
   });
 
-  const response = await fetch(`${accountsServer}/oauth/v2/token`, {
+  const response = await zohoFetch(`${accountsServer}/oauth/v2/token`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: params.toString(),
@@ -180,7 +244,7 @@ export async function refreshAccessToken(
     refresh_token: refreshToken,
   });
 
-  const response = await fetch(`${accountsServer}/oauth/v2/token`, {
+  const response = await zohoFetch(`${accountsServer}/oauth/v2/token`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: params.toString(),
@@ -196,7 +260,7 @@ export async function refreshAccessToken(
 }
 
 export async function fetchOrganizations({ accessToken, apiDomain }) {
-  const response = await fetch(`${apiDomain}/books/v3/organizations`, {
+  const response = await zohoFetch(`${apiDomain}/books/v3/organizations`, {
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
   });
 
@@ -216,7 +280,7 @@ export async function fetchOrganizationDetails(
   organizationId,
   { accessToken, apiDomain },
 ) {
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/organizations/${organizationId}`,
     {
       headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
@@ -250,7 +314,7 @@ export async function fetchWarehouses({
   organizationId,
 }) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/locations?${params.toString()}`,
     {
       headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
@@ -275,7 +339,7 @@ export async function fetchWarehouses({
 // against one-for-one.
 export async function fetchTaxes({ accessToken, apiDomain, organizationId }) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/settings/taxes?${params.toString()}`,
     {
       headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
@@ -300,7 +364,7 @@ export async function fetchChartOfAccounts({
   organizationId,
 }) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/chartofaccounts?${params.toString()}`,
     {
       headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
@@ -326,7 +390,7 @@ export async function fetchZohoItemBySku({
   sku,
 }) {
   const params = new URLSearchParams({ organization_id: organizationId, sku });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/inventory/v1/items?${params.toString()}`,
     {
       headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
@@ -352,7 +416,7 @@ export async function fetchZohoItem(
   itemId,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/inventory/v1/items/${itemId}?${params.toString()}`,
     {
       headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
@@ -391,7 +455,7 @@ export async function createZohoInventoryAdjustment(
       },
     ],
   };
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/inventory/v1/inventoryadjustments?${params.toString()}`,
     {
       method: "POST",
@@ -417,7 +481,7 @@ export async function createZohoItem(
   item,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/inventory/v1/items?${params.toString()}`,
     {
       method: "POST",
@@ -444,7 +508,7 @@ export async function updateZohoItem(
   item,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/inventory/v1/items/${itemId}?${params.toString()}`,
     {
       method: "PUT",
@@ -470,7 +534,7 @@ export async function deleteZohoItem(
   itemId,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/inventory/v1/items/${itemId}?${params.toString()}`,
     {
       method: "DELETE",
@@ -495,7 +559,7 @@ export async function setZohoItemActiveStatus(
   isActive,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/inventory/v1/items/${itemId}/${isActive ? "active" : "inactive"}?${params.toString()}`,
     {
       method: "POST",
@@ -524,7 +588,7 @@ export async function fetchZohoContactByEmail({
   email,
 }) {
   const params = new URLSearchParams({ organization_id: organizationId, email });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/contacts?${params.toString()}`,
     {
       headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
@@ -549,7 +613,7 @@ export async function createZohoContact(
   contact,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/contacts?${params.toString()}`,
     {
       method: "POST",
@@ -576,7 +640,7 @@ export async function updateZohoContact(
   contact,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/contacts/${contactId}?${params.toString()}`,
     {
       method: "PUT",
@@ -602,7 +666,7 @@ export async function deleteZohoContact(
   contactId,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/contacts/${contactId}?${params.toString()}`,
     {
       method: "DELETE",
@@ -629,7 +693,7 @@ export async function setZohoContactActiveStatus(
   isActive,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/contacts/${contactId}/${isActive ? "active" : "inactive"}?${params.toString()}`,
     {
       method: "POST",
@@ -651,7 +715,7 @@ export async function createZohoSalesOrder(
   salesOrder,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/salesorders?${params.toString()}`,
     {
       method: "POST",
@@ -678,7 +742,7 @@ export async function updateZohoSalesOrder(
   salesOrder,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/salesorders/${salesOrderId}?${params.toString()}`,
     {
       method: "PUT",
@@ -708,7 +772,7 @@ export async function voidZohoSalesOrder(
   salesOrderId,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/salesorders/${salesOrderId}/status/void?${params.toString()}`,
     {
       method: "POST",
@@ -737,7 +801,7 @@ export async function createZohoInvoiceFromSalesOrder(
     organization_id: organizationId,
     salesorder_id: salesOrderId,
   });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/invoices/fromsalesorder?${params.toString()}`,
     {
       method: "POST",
@@ -767,7 +831,7 @@ export async function fetchZohoSalesOrder(
   salesOrderId,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/salesorders/${salesOrderId}?${params.toString()}`,
     {
       headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
@@ -812,7 +876,7 @@ export async function createZohoPackage(
     })),
   };
 
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/inventory/v1/packages?${params.toString()}`,
     {
       method: "POST",
@@ -856,7 +920,7 @@ export async function createZohoShipmentOrder(
     tracking_number: trackingNumber,
   };
 
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/inventory/v1/shipmentorders?${params.toString()}`,
     {
       method: "POST",
@@ -885,7 +949,7 @@ export async function createZohoCustomerPayment(
   payment,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/customerpayments?${params.toString()}`,
     {
       method: "POST",
@@ -915,7 +979,7 @@ export async function fetchZohoInvoice(
   invoiceId,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/invoices/${invoiceId}?${params.toString()}`,
     {
       headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
@@ -973,7 +1037,7 @@ export async function createZohoCreditNote(
       ...(lineItem.taxId ? { tax_id: lineItem.taxId } : {}),
     })),
   };
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/creditnotes?${params.toString()}`,
     {
       method: "POST",
@@ -999,7 +1063,7 @@ export async function fetchZohoCreditNote(
   creditNoteId,
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/creditnotes/${creditNoteId}?${params.toString()}`,
     { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } },
   );
@@ -1031,7 +1095,7 @@ export async function applyZohoCreditNoteToInvoice(
   const body = {
     invoices: [{ invoice_id: invoiceId, amount_applied: amountApplied }],
   };
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/creditnotes/${creditNoteId}/invoices?${params.toString()}`,
     {
       method: "POST",
@@ -1068,7 +1132,7 @@ export async function createZohoCreditNoteRefund(
     from_account_id: fromAccountId,
     reference_number: referenceNumber,
   };
-  const response = await fetch(
+  const response = await zohoFetch(
     `${apiDomain}/books/v3/creditnotes/${creditNoteId}/refunds?${params.toString()}`,
     {
       method: "POST",
