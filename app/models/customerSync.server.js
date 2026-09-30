@@ -44,7 +44,7 @@ export async function getCustomerMappings(shopId) {
     rows.map((row) => [
       row.shopify_id,
       {
-        zohoId: row.zoho_id,
+        zohoId: row.zoho_id || null,
         status: row.status,
         lastSyncedAt: row.last_synced_at,
         lastError: row.last_error,
@@ -55,7 +55,7 @@ export async function getCustomerMappings(shopId) {
 
 export async function getCustomerMapping(shopId, shopifyCustomerId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id, created_by_app FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
+    `SELECT shopify_id, zoho_id, created_by_app FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ? AND zoho_id <> ''`,
     [shopId, ENTITY_TYPE, shopifyCustomerId],
   );
 
@@ -84,8 +84,10 @@ export async function markCustomerMappingError(
   errorMessage,
 ) {
   await db.execute(
-    `UPDATE sync_mappings SET status = 'error', last_error = ? WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
-    [errorMessage, shopId, ENTITY_TYPE, shopifyCustomerId],
+    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, zoho_id, status, last_synced_at, last_error)
+       VALUES (?, ?, ?, '', 'error', NOW(), ?)
+       ON DUPLICATE KEY UPDATE status = 'error', last_synced_at = NOW(), last_error = VALUES(last_error)`,
+    [shopId, ENTITY_TYPE, shopifyCustomerId, errorMessage],
   );
 }
 

@@ -50,7 +50,7 @@ export async function getProductMappings(shopId) {
     rows.map((row) => [
       row.shopify_id,
       {
-        zohoId: row.zoho_id,
+        zohoId: row.zoho_id || null,
         status: row.status,
         lastSyncedAt: row.last_synced_at,
         lastError: row.last_error,
@@ -91,23 +91,26 @@ export async function saveProductMapping(
   );
 }
 
-// Records a failure against an already-mapped variant (re-sync of an
-// existing item failed). A no-op if the variant never mapped successfully
-// in the first place - that failure lives only in the sync_logs run entry.
+// Records a sync failure. If the variant never mapped successfully, a
+// placeholder row (empty zoho_id) is created so the Products page can show
+// "Sync failed" with the reason instead of "Not synced"; every mapping
+// reader ignores placeholders when it needs a real Zoho id.
 export async function markProductMappingError(
   shopId,
   shopifyVariantId,
   errorMessage,
 ) {
   await db.execute(
-    `UPDATE sync_mappings SET status = 'error', last_error = ? WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
-    [errorMessage, shopId, ENTITY_TYPE, shopifyVariantId],
+    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, zoho_id, status, last_synced_at, last_error)
+       VALUES (?, ?, ?, '', 'error', NOW(), ?)
+       ON DUPLICATE KEY UPDATE status = 'error', last_synced_at = NOW(), last_error = VALUES(last_error)`,
+    [shopId, ENTITY_TYPE, shopifyVariantId, errorMessage],
   );
 }
 
 export async function getProductMapping(shopId, shopifyVariantId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
+    `SELECT shopify_id, zoho_id FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ? AND zoho_id <> ''`,
     [shopId, ENTITY_TYPE, shopifyVariantId],
   );
 
@@ -116,7 +119,7 @@ export async function getProductMapping(shopId, shopifyVariantId) {
 
 export async function getProductMappingsByParentId(shopId, shopifyParentId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id, created_by_app FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_parent_id = ?`,
+    `SELECT shopify_id, zoho_id, created_by_app FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_parent_id = ? AND zoho_id <> ''`,
     [shopId, ENTITY_TYPE, shopifyParentId],
   );
 
