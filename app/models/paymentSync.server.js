@@ -1,5 +1,5 @@
 import db from "../db.server";
-import { createZohoCustomerPayment } from "../zoho.server";
+import { createZohoCustomerPayment, fetchZohoInvoice } from "../zoho.server";
 import {
   getConnectionForShopDomain,
   getValidAccessToken,
@@ -87,14 +87,18 @@ export function mapPaymentMode(paymentGatewayNames) {
   return "others";
 }
 
-export function buildZohoPaymentPayload(order, { customerId, invoiceId, accountId }) {
-  const amount = Number(order.totalPrice) || 0;
+// `amount` overrides the order total - payment sync passes the smaller of
+// Shopify's total and the Zoho invoice's balance due, since Zoho rejects a
+// payment larger than the balance (error 24016). The date is when Shopify
+// processed the order, not `updatedAt`, which moves with every later edit.
+export function buildZohoPaymentPayload(order, { customerId, invoiceId, accountId, amount: amountOverride }) {
+  const amount = amountOverride ?? (Number(order.totalPrice) || 0);
 
   return {
     customer_id: customerId,
     payment_mode: mapPaymentMode(order.paymentGatewayNames),
     amount,
-    date: (order.updatedAt || order.createdAt || "").slice(0, 10),
+    date: (order.processedAt || order.createdAt || order.updatedAt || "").slice(0, 10),
     reference_number: order.name,
     ...(accountId ? { account_id: accountId } : {}),
     invoices: [{ invoice_id: invoiceId, amount_applied: amount }],
@@ -129,13 +133,28 @@ async function syncPaymentForOrderUnlocked({
     return { orderName: order.name, status: "skipped", reason: "already paid" };
   }
 
-  const payload = buildZohoPaymentPayload(order, {
-    customerId,
-    invoiceId,
-    accountId: accountSettings?.paymentAccountId,
-  });
-
   try {
+    // Pay against what Zoho says is actually owed. Shopify's total can be
+    // higher than the invoice (tax-inclusive differences, shipping tax,
+    // rounding), and Zoho rejects any payment above the balance due.
+    const invoice = await fetchZohoInvoice(zohoAuth, invoiceId);
+    const balance = Math.round((Number(invoice?.balance) || 0) * 100) / 100;
+    const shopifyTotal = Number(order.totalPrice) || 0;
+    if (balance <= 0) {
+      return { orderName: order.name, status: "skipped", reason: "invoice has no balance due in Zoho" };
+    }
+    const amount = Math.min(shopifyTotal, balance);
+    if (Math.abs(shopifyTotal - balance) > 0.01) {
+      console.warn("Shopify total differs from Zoho invoice balance", order.name, { shopifyTotal, balance });
+    }
+
+    const payload = buildZohoPaymentPayload(order, {
+      customerId,
+      invoiceId,
+      accountId: accountSettings?.paymentAccountId,
+      amount,
+    });
+
     const payment = await createZohoCustomerPayment(zohoAuth, payload);
     await savePaymentMapping(shopId, order.id, payment.payment_id);
 

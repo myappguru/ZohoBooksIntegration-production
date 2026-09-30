@@ -342,6 +342,10 @@ export const PRODUCTS_QUERY = `#graphql
                 inventoryQuantity
               }
             }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
           }
         }
       }
@@ -360,7 +364,53 @@ export function normalizeProductNode(node) {
     ...node,
     imageUrl: node.featuredMedia?.preview?.image?.url || null,
     variants: (node.variants?.edges || []).map(({ node: variant }) => variant),
+    variantsCursor: node.variants?.pageInfo?.hasNextPage ? node.variants.pageInfo.endCursor : null,
   };
+}
+
+// Products can have up to 2048 variants, but PRODUCTS_QUERY only fetches
+// the first 50 inline - page through the rest so bulk sync doesn't
+// silently ignore them.
+const PRODUCT_VARIANTS_QUERY = `#graphql
+  query ProductRemainingVariants($id: ID!, $after: String) {
+    product(id: $id) {
+      variants(first: 250, after: $after) {
+        edges {
+          node {
+            id
+            title
+            sku
+            price
+            inventoryQuantity
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+`;
+
+async function fetchRemainingProductVariants(admin, productId, after) {
+  const variants = [];
+  let cursor = after;
+
+  while (cursor) {
+    const response = await admin.graphql(PRODUCT_VARIANTS_QUERY, {
+      variables: { id: productId, after: cursor },
+    });
+    const json = await response.json();
+    if (json.errors) {
+      throw new Error(`Failed to load variants for ${productId}: ${JSON.stringify(json.errors)}`);
+    }
+    const connection = json.data?.product?.variants;
+    variants.push(...(connection?.edges || []).map(({ node }) => node));
+    cursor = connection?.pageInfo?.hasNextPage ? connection.pageInfo.endCursor : null;
+  }
+
+  return variants;
 }
 
 // The "Sync now"/"Sync everything" actions have to cover the whole catalog
@@ -376,9 +426,19 @@ async function fetchAllProductsForSync(admin) {
       variables: { first: 250, after },
     });
     const json = await response.json();
+    if (json.errors) {
+      throw new Error(`Failed to load Shopify products: ${JSON.stringify(json.errors)}`);
+    }
     const edges = json.data?.products?.edges || [];
 
-    allProducts.push(...edges.map(({ node }) => normalizeProductNode(node)));
+    for (const { node } of edges) {
+      const product = normalizeProductNode(node);
+      if (product.variantsCursor) {
+        product.variants.push(...(await fetchRemainingProductVariants(admin, product.id, product.variantsCursor)));
+        product.variantsCursor = null;
+      }
+      allProducts.push(product);
+    }
 
     const pageInfo = json.data?.products?.pageInfo;
     if (!pageInfo?.hasNextPage) break;

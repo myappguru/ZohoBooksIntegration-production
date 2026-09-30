@@ -226,3 +226,24 @@ describe("normalizeRestOrder", () => {
     expect(order.lineItems[0].taxLines).toEqual([{ title: "GST 18%", rate: 0.18 }]);
   });
 });
+
+describe("buildZohoSalesOrderPayload free-text lines", () => {
+  it("sends a line without a Zoho item as a named free-text line instead of dropping it", () => {
+    const payload = buildZohoSalesOrderPayload(
+      { createdAt: "2026-09-30T00:00:00Z", name: "#3001", totalDiscount: "0", totalShipping: "0", note: "", discountCodes: [] },
+      {
+        customerId: "c1",
+        lineItems: [
+          { zohoItemId: "i1", title: "Mug", quantity: 1, price: "10.00", taxLines: [] },
+          { zohoItemId: null, title: "Tip", quantity: 1, price: "5.00", taxLines: [] },
+        ],
+        taxSettings: {},
+      },
+    );
+
+    expect(payload.line_items).toEqual([
+      { item_id: "i1", quantity: 1, rate: 10 },
+      { name: "Tip", description: "Tip", quantity: 1, rate: 5 },
+    ]);
+  });
+});

@@ -183,7 +183,12 @@ export function buildZohoSalesOrderPayload(order, { customerId, lineItems, taxSe
     customer_id: customerId,
     date: formatZohoDate(order.createdAt),
     reference_number: order.name,
-    is_inclusive_tax: Boolean(taxSettings?.pricesIncludeTax),
+    // The order itself knows whether its prices included tax; the Settings
+    // toggle is only a fallback for orders normalized without that flag.
+    is_inclusive_tax:
+      typeof order.taxesIncluded === "boolean"
+        ? order.taxesIncluded
+        : Boolean(taxSettings?.pricesIncludeTax),
     discount: Number(order.totalDiscount) || 0,
     discount_type: "entity_level",
     is_discount_before_tax: taxSettings?.discountBeforeTax !== false,
@@ -197,8 +202,13 @@ export function buildZohoSalesOrderPayload(order, { customerId, lineItems, taxSe
         taxSettings?.defaultTaxId,
       );
 
+      // Lines with no Zoho item (custom items, tips, deleted products,
+      // SKU-less variants) go as free-text lines so the sales order total
+      // still matches Shopify's.
       return {
-        item_id: lineItem.zohoItemId,
+        ...(lineItem.zohoItemId
+          ? { item_id: lineItem.zohoItemId }
+          : { name: lineItem.title || "Item", description: lineItem.title || "" }),
         quantity: lineItem.quantity,
         rate: Number(lineItem.price) || 0,
         ...(taxId ? { tax_id: taxId } : {}),
@@ -211,13 +221,29 @@ export function buildZohoSalesOrderPayload(order, { customerId, lineItems, taxSe
 // variant on the spot (via the exact same syncVariantToZoho used by
 // product sync) if it hasn't been synced yet - an order shouldn't have to
 // wait on someone visiting the Products page first. Line items without a
-// SKU or a real variant (custom/manual line items) are skipped, same as
-// product sync skips variants without a SKU.
+// SKU or a real variant (custom/manual line items, tips, deleted products)
+// have no Zoho item, so they're sent as free-text lines (zohoItemId: null)
+// rather than dropped - dropping them made the sales order, invoice and
+// payment disagree with Shopify's total. A variant whose own sync fails
+// throws instead, so the order is marked failed with the reason rather than
+// silently syncing short.
+export class OrderLineItemError extends Error {}
+
 async function resolveOrderLineItems({ shopId, admin, zohoAuth, order, productMappings, inventoryAccountId }) {
   const resolved = [];
 
   for (const lineItem of order.lineItems) {
-    if (!lineItem.sku || !lineItem.variantId) continue;
+    if (!lineItem.sku || !lineItem.variantId) {
+      if (!(Number(lineItem.quantity) > 0)) continue;
+      resolved.push({
+        zohoItemId: null,
+        title: lineItem.title,
+        quantity: lineItem.quantity,
+        price: lineItem.price,
+        taxLines: lineItem.taxLines,
+      });
+      continue;
+    }
 
     const existingZohoItemId = productMappings[lineItem.variantId]?.zohoId;
 
@@ -236,6 +262,7 @@ async function resolveOrderLineItems({ shopId, admin, zohoAuth, order, productMa
       // Products page already owns keeping name/price accurate.
       resolved.push({
         zohoItemId: existingZohoItemId,
+        title: lineItem.title,
         quantity: lineItem.quantity,
         price: lineItem.price,
         taxLines: lineItem.taxLines,
@@ -266,14 +293,19 @@ async function resolveOrderLineItems({ shopId, admin, zohoAuth, order, productMa
       inventoryAccountId,
     });
 
-    if (result.status === "success") {
-      resolved.push({
-        zohoItemId: result.zohoItemId,
-        quantity: lineItem.quantity,
-        price: lineItem.price,
-        taxLines: lineItem.taxLines,
-      });
+    if (result.status !== "success") {
+      throw new OrderLineItemError(
+        `Line item "${lineItem.title}" (SKU ${lineItem.sku}) could not be synced to Zoho: ${result.error || result.status}`,
+      );
     }
+
+    resolved.push({
+      zohoItemId: result.zohoItemId,
+      title: lineItem.title,
+      quantity: lineItem.quantity,
+      price: lineItem.price,
+      taxLines: lineItem.taxLines,
+    });
   }
 
   return resolved;
@@ -343,16 +375,23 @@ async function syncOrderToZohoUnlocked({
     return { orderName: order.name, status: "error", error: `customer: ${customerResult.error}` };
   }
 
-  const lineItems = await resolveOrderLineItems({
-    shopId,
-    admin,
-    zohoAuth,
-    order,
-    productMappings,
-    inventoryAccountId,
-  });
+  let lineItems;
+  try {
+    lineItems = await resolveOrderLineItems({
+      shopId,
+      admin,
+      zohoAuth,
+      order,
+      productMappings,
+      inventoryAccountId,
+    });
+  } catch (error) {
+    if (!(error instanceof OrderLineItemError)) throw error;
+    await markOrderMappingError(shopId, order.id, error.message);
+    return { orderName: order.name, status: "error", error: error.message };
+  }
   if (lineItems.length === 0) {
-    return { orderName: order.name, status: "skipped" };
+    return { orderName: order.name, status: "skipped", reason: "order has no line items" };
   }
 
   const payload = buildZohoSalesOrderPayload(order, {
@@ -444,6 +483,8 @@ export const ORDERS_QUERY = `#graphql
           name
           createdAt
           updatedAt
+          processedAt
+          taxesIncluded
           email
           phone
           displayFinancialStatus
@@ -503,6 +544,10 @@ export const ORDERS_QUERY = `#graphql
                 }
               }
             }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
           }
           totalDiscountsSet {
             shopMoney {
@@ -536,6 +581,79 @@ export const ORDERS_QUERY = `#graphql
   }
 `;
 
+// Follow-up for orders with more than the 50 line items ORDERS_QUERY
+// fetches inline - without it, lines past 50 were silently dropped and the
+// Zoho sales order came out short.
+const ORDER_LINE_ITEMS_QUERY = `#graphql
+  query OrderRemainingLineItems($id: ID!, $after: String) {
+    order(id: $id) {
+      lineItems(first: 100, after: $after) {
+        edges {
+          node {
+            title
+            sku
+            quantity
+            variant {
+              id
+              product {
+                id
+              }
+            }
+            originalUnitPriceSet {
+              shopMoney {
+                amount
+              }
+            }
+            taxLines {
+              title
+              rate
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+`;
+
+function normalizeOrderLineItemNode(lineItem) {
+  return {
+    variantId: lineItem.variant?.id || null,
+    productId: lineItem.variant?.product?.id || null,
+    sku: lineItem.sku,
+    title: lineItem.title,
+    quantity: lineItem.quantity,
+    price: lineItem.originalUnitPriceSet?.shopMoney?.amount,
+    taxLines: (lineItem.taxLines || []).map((line) => ({
+      title: line.title,
+      rate: Number(line.rate) || 0,
+    })),
+  };
+}
+
+async function fetchRemainingOrderLineItems(admin, orderId, after) {
+  const lineItems = [];
+  let cursor = after;
+
+  while (cursor) {
+    const response = await admin.graphql(ORDER_LINE_ITEMS_QUERY, {
+      variables: { id: orderId, after: cursor },
+    });
+    const json = await response.json();
+    if (json.errors) {
+      throw new Error(`Failed to load line items for ${orderId}: ${JSON.stringify(json.errors)}`);
+    }
+    const connection = json.data?.order?.lineItems;
+    lineItems.push(...(connection?.edges || []).map(({ node }) => normalizeOrderLineItemNode(node)));
+    cursor = connection?.pageInfo?.hasNextPage ? connection.pageInfo.endCursor : null;
+  }
+
+  return lineItems;
+}
+
 export function normalizeOrderNode(node) {
   const address = node.customer?.defaultAddress || {};
 
@@ -544,6 +662,8 @@ export function normalizeOrderNode(node) {
     name: node.name,
     createdAt: node.createdAt,
     updatedAt: node.updatedAt,
+    processedAt: node.processedAt || null,
+    taxesIncluded: typeof node.taxesIncluded === "boolean" ? node.taxesIncluded : undefined,
     email: node.email || null,
     phone: node.phone || null,
     financialStatus: node.displayFinancialStatus || null,
@@ -578,18 +698,8 @@ export function normalizeOrderNode(node) {
       country: node.billingAddress?.country || "",
       phone: node.billingAddress?.phone || "",
     },
-    lineItems: (node.lineItems?.edges || []).map(({ node: lineItem }) => ({
-      variantId: lineItem.variant?.id || null,
-      productId: lineItem.variant?.product?.id || null,
-      sku: lineItem.sku,
-      title: lineItem.title,
-      quantity: lineItem.quantity,
-      price: lineItem.originalUnitPriceSet?.shopMoney?.amount,
-      taxLines: (lineItem.taxLines || []).map((line) => ({
-        title: line.title,
-        rate: Number(line.rate) || 0,
-      })),
-    })),
+    lineItems: (node.lineItems?.edges || []).map(({ node: lineItem }) => normalizeOrderLineItemNode(lineItem)),
+    lineItemsCursor: node.lineItems?.pageInfo?.hasNextPage ? node.lineItems.pageInfo.endCursor : null,
     totalDiscount: node.totalDiscountsSet?.shopMoney?.amount,
     totalShipping: node.totalShippingPriceSet?.shopMoney?.amount,
     shippingMethod: node.shippingLine?.title || null,
@@ -664,9 +774,21 @@ export async function fetchAllOrdersForSync(admin) {
       variables: { first: 250, after },
     });
     const json = await response.json();
+    // Returning a partial list here would make "Sync now" and payment
+    // reconciliation silently skip orders, so surface the failure instead.
+    if (json.errors) {
+      throw new Error(`Failed to load Shopify orders: ${JSON.stringify(json.errors)}`);
+    }
     const edges = json.data?.orders?.edges || [];
 
-    allOrders.push(...edges.map(({ node }) => normalizeOrderNode(node)));
+    for (const { node } of edges) {
+      const order = normalizeOrderNode(node);
+      if (order.lineItemsCursor) {
+        order.lineItems.push(...(await fetchRemainingOrderLineItems(admin, order.id, order.lineItemsCursor)));
+        order.lineItemsCursor = null;
+      }
+      allOrders.push(order);
+    }
 
     const pageInfo = json.data?.orders?.pageInfo;
     if (!pageInfo?.hasNextPage) break;
@@ -808,6 +930,8 @@ export function normalizeRestOrder(payload) {
     name: payload.name,
     createdAt: payload.created_at,
     updatedAt: payload.updated_at || payload.created_at,
+    processedAt: payload.processed_at || null,
+    taxesIncluded: typeof payload.taxes_included === "boolean" ? payload.taxes_included : undefined,
     email: payload.email || payload.contact_email || null,
     phone: payload.phone || null,
     totalPrice: payload.total_price,
