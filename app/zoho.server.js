@@ -954,16 +954,23 @@ export async function fetchZohoInvoice(
 // specific invoice.
 export async function createZohoCreditNote(
   { accessToken, apiDomain, organizationId },
-  { customerId, date, lineItems },
+  { customerId, date, lineItems, isInclusiveTax, referenceNumber },
 ) {
   const params = new URLSearchParams({ organization_id: organizationId });
   const body = {
     customer_id: customerId,
     date,
+    ...(typeof isInclusiveTax === "boolean" ? { is_inclusive_tax: isInclusiveTax } : {}),
+    ...(referenceNumber ? { reference_number: referenceNumber } : {}),
+    // A line without itemId is a free-text line (shipping refund, goodwill
+    // adjustment, or an item that was a free-text line on the invoice).
     line_items: lineItems.map((lineItem) => ({
-      item_id: lineItem.itemId,
+      ...(lineItem.itemId
+        ? { item_id: lineItem.itemId }
+        : { name: lineItem.name || "Refund", description: lineItem.name || "" }),
       quantity: lineItem.quantity,
       rate: lineItem.rate,
+      ...(lineItem.taxId ? { tax_id: lineItem.taxId } : {}),
     })),
   };
   const response = await fetch(
@@ -982,6 +989,25 @@ export async function createZohoCreditNote(
 
   if (!response.ok || data.code !== 0) {
     throw new ZohoApiError("Failed to create Zoho credit note", data);
+  }
+
+  return data.creditnote;
+}
+
+export async function fetchZohoCreditNote(
+  { accessToken, apiDomain, organizationId },
+  creditNoteId,
+) {
+  const params = new URLSearchParams({ organization_id: organizationId });
+  const response = await fetch(
+    `${apiDomain}/books/v3/creditnotes/${creditNoteId}?${params.toString()}`,
+    { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } },
+  );
+
+  const data = await response.json();
+
+  if (!response.ok || data.code !== 0) {
+    throw new ZohoApiError("Failed to fetch Zoho credit note", data);
   }
 
   return data.creditnote;
