@@ -80,6 +80,8 @@ export const loader = async ({ request }) => {
   return {
     shopDomain: session.shop,
     connection: connection ? { organizationId: connection.organization_id, organizationName: connection.organization_name, dataCenter: connection.data_center, connectedAt: connection.connected_at, tokenExpiresAt: connection.access_token_expires_at, tokenMasked: token?.accessToken ? `zoho${"•".repeat(28)}${token.accessToken.slice(-4)}` : "zoho••••••••••••••••••••••••••••••••", hasToken: Boolean(token?.accessToken), needsReauth: Boolean(connection.needs_reauth), lastAuthError: connection.last_auth_error || null, connectedBy: connection.connected_by || "Zoho Books account", scope: connection.scope || null } : null,
+    connectionLastTest: appSettings.connectionTest?.testedAt || null,
+    connectionTestError: appSettings.connectionTest?.ok === false ? appSettings.connectionTest.error : null,
     organization, syncPreferences, locations, locationsError: Boolean(locationsJson.errors) && locations.length === 0,
     warehouses: warehousesResult.items, warehouseMappings, warehouseSyncError: warehousesResult.error,
     taxes: taxesResult.items, taxSyncError: taxesResult.error, taxSettings, taxRateRows, taxRates: taxRateRows,
@@ -101,7 +103,23 @@ export const action = async ({ request }) => {
     await loadZohoList(shop, "taxes", token, () => fetchTaxes({ accessToken: token.accessToken, apiDomain: token.apiDomain, organizationId: connection.organization_id }), { force: true });
     await loadZohoList(shop, "accounts", token, () => fetchChartOfAccounts({ accessToken: token.accessToken, apiDomain: token.apiDomain, organizationId: connection.organization_id }), { force: true });
   }
-  if (intent === "test-connection" && connection) await getValidAccessToken(shop.id);
+  if (intent === "test-connection" && connection) {
+    // Make a real Zoho call - a cached token alone proves nothing - and keep
+    // the outcome so the page can show it instead of crashing on failure.
+    let result;
+    try {
+      const token = await getValidAccessToken(shop.id);
+      if (!token) throw new Error("No valid Zoho access token");
+      await fetchOrganizationDetails(connection.organization_id, { accessToken: token.accessToken, apiDomain: token.apiDomain });
+      result = { ok: true, testedAt: new Date().toISOString(), error: null };
+    } catch (error) {
+      console.error("Zoho connection test failed", error);
+      const details = error.details ? ` (${error.details.message || error.details.error || JSON.stringify(error.details)})` : "";
+      result = { ok: false, testedAt: new Date().toISOString(), error: `${error.message}${details}` };
+    }
+    await mergeAppSettings(shop.id, "connectionTest", result);
+    return { intent, ...result };
+  }
   if (intent === "save-sync-preferences") await mergeAppSettings(shop.id, "syncPreferences", { products: formData.get("productsEnabled") === "true", orders: formData.get("ordersEnabled") === "true", customers: formData.get("customersEnabled") === "true" });
   if (intent === "save-warehouse-mapping") {
     for (const [key, value] of formData.entries()) { if (!key.startsWith("warehouse:")) continue; const locationId = key.slice("warehouse:".length); if (value) await saveWarehouseMapping(shop.id, locationId, value); else await removeWarehouseMapping(shop.id, locationId); }

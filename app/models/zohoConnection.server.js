@@ -1,7 +1,7 @@
 import db from "../db.server";
 import { ensureShop } from "./shop.server";
 import { withResourceLock, resourceLockKey } from "./resourceLock.server";
-import { refreshAccessToken, accountsServerForDataCenter, normalizeAccountsServer } from "../zoho.server";
+import { refreshAccessToken, revokeRefreshToken, accountsServerForDataCenter, normalizeAccountsServer } from "../zoho.server";
 
 export async function getActiveConnection(shopId) {
   const [rows] = await db.execute(
@@ -76,9 +76,30 @@ export async function updateAccessToken(connectionId, { accessToken, accessToken
   );
 }
 
+// Revokes the refresh token at Zoho (best effort) and wipes the stored
+// tokens - previously this only flipped is_active, leaving working
+// credentials for the merchant's books in the database.
 export async function disconnect(shopId) {
+  const [rows] = await db.execute(
+    `SELECT id, refresh_token, accounts_server, data_center FROM zoho_connections WHERE shop_id = ? AND is_active = TRUE`,
+    [shopId]
+  );
+
+  for (const connection of rows) {
+    try {
+      await revokeRefreshToken(
+        connection.refresh_token,
+        normalizeAccountsServer(connection.accounts_server) || accountsServerForDataCenter(connection.data_center),
+      );
+    } catch (error) {
+      console.warn("Could not revoke Zoho refresh token", connection.id, error.message);
+    }
+  }
+
   await db.execute(
-    `UPDATE zoho_connections SET is_active = FALSE, disconnected_at = NOW() WHERE shop_id = ? AND is_active = TRUE`,
+    `UPDATE zoho_connections
+     SET is_active = FALSE, disconnected_at = NOW(), access_token = NULL, refresh_token = '', access_token_expires_at = NULL
+     WHERE shop_id = ? AND is_active = TRUE`,
     [shopId]
   );
 }

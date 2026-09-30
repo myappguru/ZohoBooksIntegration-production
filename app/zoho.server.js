@@ -259,6 +259,19 @@ export async function refreshAccessToken(
   return data;
 }
 
+// Revokes a refresh token so a disconnected/uninstalled shop's Zoho access
+// can't be used again. Best effort - callers wipe the stored tokens anyway.
+export async function revokeRefreshToken(refreshToken, accountsServer = ZOHO_ACCOUNTS_URL) {
+  if (!refreshToken) return;
+  if (accountsServer !== ZOHO_ACCOUNTS_URL && !normalizeAccountsServer(accountsServer)) return;
+  const params = new URLSearchParams({ token: refreshToken });
+  const response = await zohoFetch(`${accountsServer}/oauth/v2/token/revoke?${params.toString()}`, { method: "POST" });
+  const data = await response.json();
+  if (!response.ok || data.error) {
+    throw new ZohoApiError("Failed to revoke Zoho refresh token", data);
+  }
+}
+
 export async function fetchOrganizations({ accessToken, apiDomain }) {
   const response = await zohoFetch(`${apiDomain}/books/v3/organizations`, {
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
