@@ -3,6 +3,8 @@ import {
   createZohoSalesOrder,
   updateZohoSalesOrder,
   voidZohoSalesOrder,
+  voidZohoInvoice,
+  fetchZohoInvoice,
 } from "../zoho.server";
 import {
   getConnectionForShopDomain,
@@ -535,6 +537,11 @@ export const ORDERS_QUERY = `#graphql
               amount
             }
           }
+          totalReceivedSet {
+            shopMoney {
+              amount
+            }
+          }
           paymentGatewayNames
           customer {
             id
@@ -710,6 +717,7 @@ export function normalizeOrderNode(node) {
     phone: node.phone || null,
     financialStatus: node.displayFinancialStatus || null,
     totalPrice: node.totalPriceSet?.shopMoney?.amount,
+    totalReceived: node.totalReceivedSet?.shopMoney?.amount ?? null,
     paymentGatewayNames: node.paymentGatewayNames || [],
     customer: node.customer
       ? {
@@ -916,7 +924,11 @@ export async function runOrderSync({ admin, shop, zohoAuth }) {
   });
 
   const freshOrderMappings = await getOrderMappings(shop.id);
-  const paidOrders = orders.filter((order) => order.financialStatus === "PAID");
+  // Every order money was collected on - refunds are recorded separately
+  // as credit notes, so a (partially) refunded order still needs its
+  // original invoice and payment.
+  const BACKFILL_STATUSES = new Set(["PAID", "PARTIALLY_PAID", "PARTIALLY_REFUNDED", "REFUNDED"]);
+  const paidOrders = orders.filter((order) => BACKFILL_STATUSES.has(order.financialStatus));
 
   const invoiceResults = [];
   const paymentResults = [];
@@ -977,6 +989,12 @@ export function normalizeRestOrder(payload) {
     email: payload.email || payload.contact_email || null,
     phone: payload.phone || null,
     totalPrice: payload.total_price,
+    // Money actually collected so far (orders/paid is fully paid, but a
+    // partially paid order has an outstanding balance).
+    totalReceived:
+      payload.total_outstanding != null
+        ? Math.max(0, (Number(payload.total_price) || 0) - (Number(payload.total_outstanding) || 0))
+        : null,
     paymentGatewayNames: payload.payment_gateway_names || [],
     customer: payload.customer
       ? {
@@ -1113,11 +1131,38 @@ export async function processOrderUpsertWebhook({
 // purposes while marking it inactive. The mapping row is kept (status
 // "voided") rather than removed, unlike product/customer deletion, since
 // the Shopify order itself still exists.
+//
+// A cancelled order is usually already invoiced, and Zoho won't void a sales
+// order with an invoice on it. An unpaid invoice is voided first; a paid one
+// can't be voided - the money side is recorded by the refunds/create webhook
+// as a credit note - so the order is flagged instead of reported as failed.
 export async function syncOrderCancellationToZoho({ shopId, zohoAuth, shopifyOrderId }) {
   const mapping = await getOrderMapping(shopId, shopifyOrderId);
   if (!mapping) return { status: "skipped" };
+  if (mapping.status === "voided") return { zohoSalesOrderId: mapping.zoho_id, status: "skipped", reason: "already voided" };
 
+  return withResourceLock(resourceLockKey(shopId, ENTITY_TYPE, shopifyOrderId), () =>
+    voidOrderInZoho({ shopId, zohoAuth, shopifyOrderId, mapping }),
+  );
+}
+
+async function voidOrderInZoho({ shopId, zohoAuth, shopifyOrderId, mapping }) {
   try {
+    // Lazy import: invoiceSync.server.js imports this module.
+    const { getInvoiceMapping } = await import("./invoiceSync.server");
+    const invoiceMapping = await getInvoiceMapping(shopId, shopifyOrderId);
+    if (invoiceMapping?.zoho_id) {
+      const invoice = await fetchZohoInvoice(zohoAuth, invoiceMapping.zoho_id);
+      const status = String(invoice?.status || "").toLowerCase();
+      const paidSomething = Number(invoice?.balance) < Number(invoice?.total) - 0.01;
+      if (status !== "void" && paidSomething) {
+        const message = "Cancelled in Shopify after payment - the Zoho invoice stays; the Shopify refund is recorded as a credit note.";
+        await markOrderMappingOutOfSync(shopId, shopifyOrderId, message);
+        return { zohoSalesOrderId: mapping.zoho_id, status: "skipped", reason: message };
+      }
+      if (status !== "void") await voidZohoInvoice(zohoAuth, invoiceMapping.zoho_id);
+    }
+
     await voidZohoSalesOrder(zohoAuth, mapping.zoho_id);
     await markOrderMappingVoided(shopId, shopifyOrderId);
     return { zohoSalesOrderId: mapping.zoho_id, status: "voided" };

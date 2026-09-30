@@ -802,6 +802,28 @@ export async function voidZohoSalesOrder(
   return data;
 }
 
+export async function voidZohoInvoice(
+  { accessToken, apiDomain, organizationId },
+  invoiceId,
+) {
+  const params = new URLSearchParams({ organization_id: organizationId });
+  const response = await zohoFetch(
+    `${apiDomain}/books/v3/invoices/${invoiceId}/status/void?${params.toString()}`,
+    {
+      method: "POST",
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    },
+  );
+
+  const data = await response.json();
+
+  if (!response.ok || data.code !== 0) {
+    throw new ZohoApiError("Failed to void Zoho invoice", data);
+  }
+
+  return data;
+}
+
 // Converts an existing Zoho sales order into an invoice, carrying over its
 // customer, line items, tax, discount, and shipping charge - so invoice
 // creation doesn't need to rebuild any of that from the Shopify order

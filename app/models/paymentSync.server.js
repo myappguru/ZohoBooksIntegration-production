@@ -141,11 +141,17 @@ async function syncPaymentForOrderUnlocked({
     // rounding), and Zoho rejects any payment above the balance due.
     const invoice = await fetchZohoInvoice(zohoAuth, invoiceId);
     const balance = Math.round((Number(invoice?.balance) || 0) * 100) / 100;
-    const shopifyTotal = Number(order.totalPrice) || 0;
+    // What the customer actually paid (before any refunds), falling back to
+    // the order total when the source doesn't say.
+    const shopifyTotal =
+      order.totalReceived != null ? Number(order.totalReceived) || 0 : Number(order.totalPrice) || 0;
     if (balance <= 0) {
       return { orderName: order.name, status: "skipped", reason: "invoice has no balance due in Zoho" };
     }
     const amount = Math.min(shopifyTotal, balance);
+    if (amount <= 0) {
+      return { orderName: order.name, status: "skipped", reason: "no payment received in Shopify yet" };
+    }
     if (Math.abs(shopifyTotal - balance) > 0.01) {
       console.warn("Shopify total differs from Zoho invoice balance", order.name, { shopifyTotal, balance });
     }
