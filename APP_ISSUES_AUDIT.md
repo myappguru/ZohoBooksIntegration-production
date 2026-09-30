@@ -1,7 +1,5 @@
 # App Audit: Broken and Unreliable Features
 
-_Audit date: 2026-09-30 · Branch: `master` @ `0e421fa`_
-
 ## How this audit was done
 
 - I read all of the server code: the Zoho client, every model, every webhook route, the OAuth callback, settings, and migrations. I also read the loaders, actions and main UI logic of every admin page.
