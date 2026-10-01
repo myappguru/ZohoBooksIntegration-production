@@ -1,19 +1,32 @@
-import {
-  verifyOAuthState,
-  exchangeCodeForToken,
-  fetchOrganizations,
-  dataCenterFromApiDomain,
-  getPreferredOrganizationId,
-} from "../zoho.server";
-import { ensureShop } from "../models/shop.server";
-import { getActiveConnection, saveConnection } from "../models/zohoConnection.server";
+import { verifyOAuthState, normalizeAccountsServer } from "../zoho.server";
 
-function resultPage({ title, message, success }) {
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// JSON that is safe to drop inside a <script> block.
+function scriptJson(value) {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
+
+function resultPage({ title, message, success, handoff = null }) {
+  const safeTitle = escapeHtml(title);
   const html = `<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>${title}</title>
+    <meta name="referrer" content="no-referrer" />
+    <title>${safeTitle}</title>
     <style>
       body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f6f6f7; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
       .card { background: #fff; border-radius: 12px; padding: 32px 40px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); max-width: 420px; text-align: center; }
@@ -23,33 +36,61 @@ function resultPage({ title, message, success }) {
   </head>
   <body>
     <div class="card">
-      <h1>${title}</h1>
-      <p>${message}</p>
+      <h1 id="title">${safeTitle}</h1>
+      <p id="message">${escapeHtml(message)}</p>
       <p>You can close this tab and return to Shopify admin.</p>
     </div>
     <script>
-      try {
-        if (window.opener) {
-          window.opener.postMessage({ source: "zoho-oauth", success: ${success ? "true" : "false"} }, window.location.origin);
+      (function () {
+        var handoff = ${scriptJson(handoff)};
+        var delivered = false;
+        try {
+          if (window.opener) {
+            window.opener.postMessage(
+              handoff
+                ? { source: "zoho-oauth", type: "authorization-code", code: handoff.code, state: handoff.state, accountsServer: handoff.accountsServer }
+                : { source: "zoho-oauth", success: ${success ? "true" : "false"} },
+              window.location.origin
+            );
+            delivered = true;
+          }
+        } catch (e) {}
+        if (handoff && !delivered) {
+          document.getElementById("title").textContent = "Connection not completed";
+          document.getElementById("message").textContent =
+            "Please open the app in Shopify admin and click Connect Zoho Books again.";
+          return;
         }
-      } catch (e) {}
-      setTimeout(function () { window.close(); }, 4000);
+        setTimeout(function () { window.close(); }, handoff ? 1500 : 4000);
+      })();
     </script>
   </body>
 </html>`;
 
-  return new Response(html, { headers: { "Content-Type": "text/html" } });
+  return new Response(html, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Referrer-Policy": "no-referrer",
+    },
+  });
 }
 
+// Zoho redirects the popup here. We deliberately do NOT exchange the code in
+// this request: nothing here proves which Shopify admin started the flow, so
+// a "Connect Zoho" link sent to someone else would link their Zoho org to the
+// sender's store. Instead the code is handed back to the embedded app window
+// that opened this popup, and the authenticated `/app/zoho-connect` action
+// finishes the exchange after checking the state belongs to that session.
 export const loader = async ({ request }) => {
   const url = new URL(request.url);
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state");
   const errorParam = url.searchParams.get("error");
-  // Zoho reports which data center actually issued this code (accounts.zoho.com/.in/.eu/...).
-  // A merchant's Zoho account can be on any of these, so the token exchange must target
-  // this exact server rather than a single hardcoded region.
-  const accountsServer = url.searchParams.get("accounts-server");
+  // Zoho reports which data center actually issued this code
+  // (accounts.zoho.com/.in/.eu/zohocloud.ca/...). It is only trusted when it
+  // is one of Zoho's own accounts hosts - see normalizeAccountsServer.
+  const accountsServerParam = url.searchParams.get("accounts-server");
 
   if (errorParam) {
     return resultPage({
@@ -59,9 +100,9 @@ export const loader = async ({ request }) => {
     });
   }
 
-  const shopDomain = verifyOAuthState(state);
+  const statePayload = verifyOAuthState(state);
 
-  if (!shopDomain || !code) {
+  if (!statePayload || !code) {
     return resultPage({
       title: "Connection failed",
       message: "This authorization link is invalid or has expired. Please try connecting again from the app.",
@@ -69,64 +110,20 @@ export const loader = async ({ request }) => {
     });
   }
 
-  try {
-    const shop = await ensureShop(shopDomain);
-    const tokenResponse = await exchangeCodeForToken(code, accountsServer || undefined);
-
-    let refreshToken = tokenResponse.refresh_token;
-    if (!refreshToken) {
-      const existing = await getActiveConnection(shop.id);
-      refreshToken = existing?.refresh_token;
-    }
-
-    if (!refreshToken) {
-      return resultPage({
-        title: "Connection failed",
-        message: "Zoho did not grant offline access. Please try connecting again and approve the request.",
-        success: false,
-      });
-    }
-
-    const organizations = await fetchOrganizations({
-      accessToken: tokenResponse.access_token,
-      apiDomain: tokenResponse.api_domain,
-    });
-
-    const preferredOrgId = getPreferredOrganizationId();
-    const organization =
-      organizations.find((org) => org.organization_id === preferredOrgId) || organizations[0];
-
-    if (!organization) {
-      return resultPage({
-        title: "No Zoho organization found",
-        message: "We couldn't find any Zoho Books organization on this account.",
-        success: false,
-      });
-    }
-
-    await saveConnection(shop.id, {
-      organizationId: organization.organization_id,
-      organizationName: organization.name,
-      accessToken: tokenResponse.access_token,
-      refreshToken,
-      apiDomain: tokenResponse.api_domain,
-      dataCenter: dataCenterFromApiDomain(tokenResponse.api_domain),
-      scope: tokenResponse.scope,
-      accessTokenExpiresAt: new Date(Date.now() + tokenResponse.expires_in * 1000),
-    });
-
-    return resultPage({
-      title: "Zoho Books connected",
-      message: `Connected to "${organization.name}" successfully.`,
-      success: true,
-    });
-  } catch (error) {
-    console.error("Zoho OAuth callback failed", error);
-
+  const accountsServer = accountsServerParam ? normalizeAccountsServer(accountsServerParam) : null;
+  if (accountsServerParam && !accountsServer) {
+    console.warn("Rejected Zoho OAuth callback with untrusted accounts-server", { accountsServer: accountsServerParam, shop: statePayload.shop });
     return resultPage({
       title: "Connection failed",
-      message: "Something went wrong while connecting to Zoho Books. Please try again.",
+      message: "This authorization response did not come from Zoho. Please try connecting again from the app.",
       success: false,
     });
   }
+
+  return resultPage({
+    title: "Finishing connection…",
+    message: "Returning to the app to complete the Zoho Books connection.",
+    success: true,
+    handoff: { code, state, accountsServer },
+  });
 };

@@ -8,6 +8,7 @@ import { authenticate } from "../shopify.server";
 import Footer from "../components/Footer";
 import { useTranslation } from "../locales/translation";
 
+/* global process */
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
 

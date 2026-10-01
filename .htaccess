@@ -4,6 +4,16 @@
   Require all denied
 </FilesMatch>
 
+# The parent public_html/.htaccess (WP Rocket, for the WordPress site) sets
+# "ExpiresDefault access plus 1 month". Apache inherits that here, so any app
+# response without its own Cache-Control - e.g. React Router .data responses
+# before app.jsx sent no-store - was cached by browsers for 30 days, showing
+# merchants stale pages (a dashboard stuck on "Zoho not connected"). The app
+# sets its own caching headers; never let the WordPress rules apply.
+<IfModule mod_expires.c>
+  ExpiresActive Off
+</IfModule>
+
 # Without this, requests to routes that share a name with a real folder here
 # (e.g. /app, matching the app/ source directory) get a 301-to-trailing-slash
 # from mod_dir before the proxy rule below ever runs, breaking those routes.

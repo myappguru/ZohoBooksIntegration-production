@@ -3,7 +3,8 @@ import {
   createZohoInvoiceFromSalesOrder,
   fetchZohoSalesOrder,
 } from "../zoho.server";
-import { syncOrderToZoho } from "./orderSync.server";
+import { syncOrderToZoho, getOrderMapping } from "./orderSync.server";
+import { withResourceLock, resourceLockKey } from "./resourceLock.server";
 
 const ENTITY_TYPE = "invoice";
 
@@ -24,7 +25,7 @@ export async function getInvoiceMappings(shopId) {
     rows.map((row) => [
       row.shopify_id,
       {
-        zohoId: row.zoho_id,
+        zohoId: row.zoho_id || null,
         status: row.status,
         lastSyncedAt: row.last_synced_at,
         lastError: row.last_error,
@@ -35,7 +36,7 @@ export async function getInvoiceMappings(shopId) {
 
 export async function getInvoiceMapping(shopId, shopifyOrderId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
+    `SELECT shopify_id, zoho_id FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ? AND zoho_id <> ''`,
     [shopId, ENTITY_TYPE, shopifyOrderId],
   );
 
@@ -53,8 +54,10 @@ export async function saveInvoiceMapping(shopId, shopifyOrderId, zohoInvoiceId) 
 
 export async function markInvoiceMappingError(shopId, shopifyOrderId, errorMessage) {
   await db.execute(
-    `UPDATE sync_mappings SET status = 'error', last_error = ? WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
-    [errorMessage, shopId, ENTITY_TYPE, shopifyOrderId],
+    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, zoho_id, status, last_synced_at, last_error)
+       VALUES (?, ?, ?, '', 'error', NOW(), ?)
+       ON DUPLICATE KEY UPDATE status = 'error', last_synced_at = NOW(), last_error = VALUES(last_error)`,
+    [shopId, ENTITY_TYPE, shopifyOrderId, errorMessage],
   );
 }
 
@@ -66,7 +69,16 @@ export async function markInvoiceMappingError(shopId, shopifyOrderId, errorMessa
 // the spot via the exact same syncOrderToZoho used by order sync, then
 // immediately converted - an invoice shouldn't have to wait on someone
 // visiting the Orders page first.
-export async function syncInvoiceForOrder({
+//
+// Serialized per order so two concurrent orders/paid deliveries (or a
+// webhook racing "Sync now") can't both convert the sales order.
+export async function syncInvoiceForOrder(args) {
+  return withResourceLock(resourceLockKey(args.shopId, ENTITY_TYPE, args.order.id), () =>
+    syncInvoiceForOrderUnlocked(args),
+  );
+}
+
+async function syncInvoiceForOrderUnlocked({
   shopId,
   zohoAuth,
   order,
@@ -89,7 +101,10 @@ export async function syncInvoiceForOrder({
     };
   }
 
-  let salesOrderId = orderMappings[order.id]?.zohoId;
+  // Read fresh - the caller's snapshot may predate a sales order that a
+  // concurrent orders/create webhook has just created.
+  let salesOrderId =
+    (await getOrderMapping(shopId, order.id))?.zoho_id || orderMappings[order.id]?.zohoId;
 
   if (!salesOrderId) {
     const orderResult = await syncOrderToZoho({
@@ -114,7 +129,12 @@ export async function syncInvoiceForOrder({
     const invoice = await createZohoInvoiceFromSalesOrder(zohoAuth, salesOrderId);
     await saveInvoiceMapping(shopId, order.id, invoice.invoice_id);
 
-    return { orderName: order.name, zohoInvoiceId: invoice.invoice_id, status: "success" };
+    return {
+      orderName: order.name,
+      zohoInvoiceId: invoice.invoice_id,
+      zohoCustomerId: invoice.customer_id || null,
+      status: "success",
+    };
   } catch (error) {
     // Zoho reports "no items left to invoice" (36026) when the sales
     // order has already been fully invoiced by something outside this
@@ -129,7 +149,12 @@ export async function syncInvoiceForOrder({
         const existing = salesOrder?.invoices?.[0];
         if (existing) {
           await saveInvoiceMapping(shopId, order.id, existing.invoice_id);
-          return { orderName: order.name, zohoInvoiceId: existing.invoice_id, status: "success" };
+          return {
+            orderName: order.name,
+            zohoInvoiceId: existing.invoice_id,
+            zohoCustomerId: salesOrder.customer_id || null,
+            status: "success",
+          };
         }
       } catch (lookupError) {
         console.error("Failed to look up existing Zoho invoice for order", order.name, lookupError);

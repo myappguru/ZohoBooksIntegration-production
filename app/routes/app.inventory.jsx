@@ -1,6 +1,8 @@
 import { useMemo, useState } from "react";
 import { Form, useLoaderData, useNavigation } from "react-router";
 import { authenticate } from "../shopify.server";
+import { useRevalidateWhileRunning } from "../hooks/useRevalidateWhileRunning";
+import { startSyncJob } from "../models/syncJobs.server";
 import { getConnectionForShopDomain, getValidAccessToken } from "../models/zohoConnection.server";
 import { getAppSettings } from "../models/appSettings.server";
 import { getWarehouseMappings } from "../models/warehouseMapping.server";
@@ -161,16 +163,13 @@ export const action = async ({ request }) => {
     return null;
   });
   if (!token) return null;
-  await runInventoryPull({
-    admin,
-    shop,
-    zohoAuth: {
-      accessToken: token.accessToken,
-      apiDomain: token.apiDomain,
-      organizationId: connection.organization_id,
-    },
-  });
-  return null;
+  const zohoAuth = {
+    accessToken: token.accessToken,
+    apiDomain: token.apiDomain,
+    organizationId: connection.organization_id,
+  };
+  const job = startSyncJob(shop.id, "inventory-pull", () => runInventoryPull({ admin, shop, zohoAuth }));
+  return { ok: true, started: job.started };
 };
 
 function number(value) {
@@ -208,6 +207,7 @@ function Stat({ label, value, caption, icon, tone }) {
 
 export default function InventoryPage() {
   const data = useLoaderData();
+  useRevalidateWhileRunning(data.latestPullLog);
   const navigation = useNavigation();
   const [search, setSearch] = useState("");
   const [location, setLocation] = useState("all");

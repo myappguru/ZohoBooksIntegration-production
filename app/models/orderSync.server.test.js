@@ -180,10 +180,16 @@ describe("buildOrderCustomer", () => {
     expect(customer.address.address1).toBe("1 Main St");
   });
 
-  it("returns a null id when there's no customer and no email at all", () => {
+  it("uses the shared walk-in contact when there's no customer, email or phone (e.g. POS sale)", () => {
     const customer = buildOrderCustomer({});
-    expect(customer.id).toBeNull();
+    expect(customer.id).toBe("guest:walk-in");
     expect(customer.email).toBeNull();
+  });
+
+  it("keys a phone-only guest checkout on the phone number", () => {
+    const customer = buildOrderCustomer({ phone: "+91 98765 43210", billingAddress: { firstName: "Asha" } });
+    expect(customer.id).toBe("guest-phone:+919876543210");
+    expect(customer.firstName).toBe("Asha");
   });
 });
 
@@ -224,5 +230,26 @@ describe("normalizeRestOrder", () => {
     });
 
     expect(order.lineItems[0].taxLines).toEqual([{ title: "GST 18%", rate: 0.18 }]);
+  });
+});
+
+describe("buildZohoSalesOrderPayload free-text lines", () => {
+  it("sends a line without a Zoho item as a named free-text line instead of dropping it", () => {
+    const payload = buildZohoSalesOrderPayload(
+      { createdAt: "2026-09-30T00:00:00Z", name: "#3001", totalDiscount: "0", totalShipping: "0", note: "", discountCodes: [] },
+      {
+        customerId: "c1",
+        lineItems: [
+          { zohoItemId: "i1", title: "Mug", quantity: 1, price: "10.00", taxLines: [] },
+          { zohoItemId: null, title: "Tip", quantity: 1, price: "5.00", taxLines: [] },
+        ],
+        taxSettings: {},
+      },
+    );
+
+    expect(payload.line_items).toEqual([
+      { item_id: "i1", quantity: 1, rate: 10 },
+      { name: "Tip", description: "Tip", quantity: 1, rate: 5 },
+    ]);
   });
 });

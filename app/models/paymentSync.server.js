@@ -1,12 +1,12 @@
 import db from "../db.server";
-import { createZohoCustomerPayment } from "../zoho.server";
+import { createZohoCustomerPayment, fetchZohoInvoice } from "../zoho.server";
 import {
   getConnectionForShopDomain,
   getValidAccessToken,
 } from "./zohoConnection.server";
 import { getAppSettings } from "./appSettings.server";
 import { getProductMappings } from "./productSync.server";
-import { getCustomerMappings } from "./customerSync.server";
+import { getCustomerMappings, getCustomerMapping } from "./customerSync.server";
 import {
   getOrderMappings,
   normalizeRestOrder,
@@ -14,6 +14,7 @@ import {
 } from "./orderSync.server";
 import { syncInvoiceForOrder } from "./invoiceSync.server";
 import { recordWebhookReceived, finishWebhookLog } from "./webhookLog.server";
+import { withResourceLock, resourceLockKey } from "./resourceLock.server";
 
 const ENTITY_TYPE = "payment";
 
@@ -34,7 +35,7 @@ export async function getPaymentMappings(shopId) {
     rows.map((row) => [
       row.shopify_id,
       {
-        zohoId: row.zoho_id,
+        zohoId: row.zoho_id || null,
         status: row.status,
         lastSyncedAt: row.last_synced_at,
         lastError: row.last_error,
@@ -45,7 +46,7 @@ export async function getPaymentMappings(shopId) {
 
 export async function getPaymentMapping(shopId, shopifyOrderId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
+    `SELECT shopify_id, zoho_id FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ? AND zoho_id <> ''`,
     [shopId, ENTITY_TYPE, shopifyOrderId],
   );
 
@@ -63,8 +64,10 @@ export async function savePaymentMapping(shopId, shopifyOrderId, zohoPaymentId) 
 
 export async function markPaymentMappingError(shopId, shopifyOrderId, errorMessage) {
   await db.execute(
-    `UPDATE sync_mappings SET status = 'error', last_error = ? WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
-    [errorMessage, shopId, ENTITY_TYPE, shopifyOrderId],
+    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, zoho_id, status, last_synced_at, last_error)
+       VALUES (?, ?, ?, '', 'error', NOW(), ?)
+       ON DUPLICATE KEY UPDATE status = 'error', last_synced_at = NOW(), last_error = VALUES(last_error)`,
+    [shopId, ENTITY_TYPE, shopifyOrderId, errorMessage],
   );
 }
 
@@ -86,14 +89,18 @@ export function mapPaymentMode(paymentGatewayNames) {
   return "others";
 }
 
-export function buildZohoPaymentPayload(order, { customerId, invoiceId, accountId }) {
-  const amount = Number(order.totalPrice) || 0;
+// `amount` overrides the order total - payment sync passes the smaller of
+// Shopify's total and the Zoho invoice's balance due, since Zoho rejects a
+// payment larger than the balance (error 24016). The date is when Shopify
+// processed the order, not `updatedAt`, which moves with every later edit.
+export function buildZohoPaymentPayload(order, { customerId, invoiceId, accountId, amount: amountOverride }) {
+  const amount = amountOverride ?? (Number(order.totalPrice) || 0);
 
   return {
     customer_id: customerId,
     payment_mode: mapPaymentMode(order.paymentGatewayNames),
     amount,
-    date: (order.updatedAt || order.createdAt || "").slice(0, 10),
+    date: (order.processedAt || order.createdAt || order.updatedAt || "").slice(0, 10),
     reference_number: order.name,
     ...(accountId ? { account_id: accountId } : {}),
     invoices: [{ invoice_id: invoiceId, amount_applied: amount }],
@@ -104,7 +111,14 @@ export function buildZohoPaymentPayload(order, { customerId, invoiceId, accountI
 // same call. Like invoice sync, this is one-shot - once an order has a
 // payment mapping, it's left alone rather than re-synced, since a recorded
 // payment is a finished accounting event, not something to keep updating.
-export async function syncPaymentForOrder({
+// Serialized per order so concurrent deliveries can't record it twice.
+export async function syncPaymentForOrder(args) {
+  return withResourceLock(resourceLockKey(args.shopId, ENTITY_TYPE, args.order.id), () =>
+    syncPaymentForOrderUnlocked(args),
+  );
+}
+
+async function syncPaymentForOrderUnlocked({
   shopId,
   zohoAuth,
   order,
@@ -121,13 +135,34 @@ export async function syncPaymentForOrder({
     return { orderName: order.name, status: "skipped", reason: "already paid" };
   }
 
-  const payload = buildZohoPaymentPayload(order, {
-    customerId,
-    invoiceId,
-    accountId: accountSettings?.paymentAccountId,
-  });
-
   try {
+    // Pay against what Zoho says is actually owed. Shopify's total can be
+    // higher than the invoice (tax-inclusive differences, shipping tax,
+    // rounding), and Zoho rejects any payment above the balance due.
+    const invoice = await fetchZohoInvoice(zohoAuth, invoiceId);
+    const balance = Math.round((Number(invoice?.balance) || 0) * 100) / 100;
+    // What the customer actually paid (before any refunds), falling back to
+    // the order total when the source doesn't say.
+    const shopifyTotal =
+      order.totalReceived != null ? Number(order.totalReceived) || 0 : Number(order.totalPrice) || 0;
+    if (balance <= 0) {
+      return { orderName: order.name, status: "skipped", reason: "invoice has no balance due in Zoho" };
+    }
+    const amount = Math.min(shopifyTotal, balance);
+    if (amount <= 0) {
+      return { orderName: order.name, status: "skipped", reason: "no payment received in Shopify yet" };
+    }
+    if (Math.abs(shopifyTotal - balance) > 0.01) {
+      console.warn("Shopify total differs from Zoho invoice balance", order.name, { shopifyTotal, balance });
+    }
+
+    const payload = buildZohoPaymentPayload(order, {
+      customerId,
+      invoiceId,
+      accountId: accountSettings?.paymentAccountId,
+      amount,
+    });
+
     const payment = await createZohoCustomerPayment(zohoAuth, payload);
     await savePaymentMapping(shopId, order.id, payment.payment_id);
 
@@ -175,7 +210,14 @@ export async function syncInvoiceAndPaymentForOrder({
     return { invoice: invoiceResult, payment: { orderName: order.name, status: "skipped" } };
   }
 
-  const customerId = customerMappings[buildOrderCustomer(order).id]?.zohoId;
+  // Prefer the customer Zoho put on the invoice itself. The customer
+  // snapshot was loaded before this call and misses a contact created
+  // during it (first-time customers), which used to skip the payment.
+  const orderCustomerId = buildOrderCustomer(order).id;
+  const customerId =
+    invoiceResult.zohoCustomerId ||
+    customerMappings[orderCustomerId]?.zohoId ||
+    (orderCustomerId ? (await getCustomerMapping(shopId, orderCustomerId))?.zoho_id : null);
 
   const paymentResult = await syncPaymentForOrder({
     shopId,

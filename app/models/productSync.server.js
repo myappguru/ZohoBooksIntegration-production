@@ -13,6 +13,8 @@ import {
 import { recordWebhookReceived, finishWebhookLog } from "./webhookLog.server";
 import { getAppSettings } from "./appSettings.server";
 import { startSyncLog, finishSyncLog } from "./syncLog.server";
+import { withResourceLock, resourceLockKey } from "./resourceLock.server";
+import { payloadHash } from "./payloadHash.server";
 
 const ENTITY_TYPE = "product";
 
@@ -41,7 +43,7 @@ export async function getSyncedProductCount(shopId) {
 
 export async function getProductMappings(shopId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id, status, last_synced_at, last_error FROM sync_mappings WHERE shop_id = ? AND entity_type = ?`,
+    `SELECT shopify_id, zoho_id, payload_hash, status, last_synced_at, last_error FROM sync_mappings WHERE shop_id = ? AND entity_type = ?`,
     [shopId, ENTITY_TYPE],
   );
 
@@ -49,7 +51,8 @@ export async function getProductMappings(shopId) {
     rows.map((row) => [
       row.shopify_id,
       {
-        zohoId: row.zoho_id,
+        zohoId: row.zoho_id || null,
+        payloadHash: row.payload_hash || null,
         status: row.status,
         lastSyncedAt: row.last_synced_at,
         lastError: row.last_error,
@@ -65,43 +68,62 @@ export async function getProductMappings(shopId) {
 // GID) is stored so a later products/delete webhook - which only gives us
 // the product's id, none of its variants' - can still find every mapping
 // row that belongs to it.
+// `createdByApp` is true when this app created the Zoho item, false when it
+// linked an item that already existed in Zoho, and null to leave the
+// stored value alone (plain re-sync of an existing mapping).
 export async function saveProductMapping(
   shopId,
   shopifyVariantId,
   zohoItemId,
   shopifyParentId,
+  createdByApp = null,
+  hash = null,
 ) {
   await db.execute(
-    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, shopify_parent_id, zoho_id, status, last_synced_at, last_error)
-     VALUES (?, ?, ?, ?, ?, 'synced', NOW(), NULL)
-     ON DUPLICATE KEY UPDATE zoho_id = VALUES(zoho_id), shopify_parent_id = VALUES(shopify_parent_id), status = 'synced', last_synced_at = NOW(), last_error = NULL`,
+    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, shopify_parent_id, zoho_id, created_by_app, payload_hash, status, last_synced_at, last_error)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'synced', NOW(), NULL)
+     ON DUPLICATE KEY UPDATE zoho_id = VALUES(zoho_id), shopify_parent_id = VALUES(shopify_parent_id), created_by_app = COALESCE(VALUES(created_by_app), created_by_app), payload_hash = COALESCE(VALUES(payload_hash), payload_hash), status = 'synced', last_synced_at = NOW(), last_error = NULL`,
     [
       shopId,
       ENTITY_TYPE,
       shopifyVariantId,
       shopifyParentId || null,
       zohoItemId,
+      createdByApp,
+      hash,
     ],
   );
 }
 
-// Records a failure against an already-mapped variant (re-sync of an
-// existing item failed). A no-op if the variant never mapped successfully
-// in the first place - that failure lives only in the sync_logs run entry.
+// Records a sync failure. If the variant never mapped successfully, a
+// placeholder row (empty zoho_id) is created so the Products page can show
+// "Sync failed" with the reason instead of "Not synced"; every mapping
+// reader ignores placeholders when it needs a real Zoho id.
 export async function markProductMappingError(
   shopId,
   shopifyVariantId,
   errorMessage,
 ) {
   await db.execute(
-    `UPDATE sync_mappings SET status = 'error', last_error = ? WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
-    [errorMessage, shopId, ENTITY_TYPE, shopifyVariantId],
+    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, zoho_id, status, last_synced_at, last_error)
+       VALUES (?, ?, ?, '', 'error', NOW(), ?)
+       ON DUPLICATE KEY UPDATE status = 'error', last_synced_at = NOW(), last_error = VALUES(last_error)`,
+    [shopId, ENTITY_TYPE, shopifyVariantId, errorMessage],
   );
+}
+
+export async function getProductMapping(shopId, shopifyVariantId) {
+  const [rows] = await db.execute(
+    `SELECT shopify_id, zoho_id, payload_hash, status FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ? AND zoho_id <> ''`,
+    [shopId, ENTITY_TYPE, shopifyVariantId],
+  );
+
+  return rows[0] || null;
 }
 
 export async function getProductMappingsByParentId(shopId, shopifyParentId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_parent_id = ?`,
+    `SELECT shopify_id, zoho_id, created_by_app FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_parent_id = ? AND zoho_id <> ''`,
     [shopId, ENTITY_TYPE, shopifyParentId],
   );
 
@@ -197,7 +219,32 @@ async function denyOversellForVariant(admin, product, variant) {
 // webhook payload (see the products.create/update webhook routes).
 // `admin` is optional - only needed to also enforce oversell prevention
 // (see denyOversellForVariant); the Zoho-side sync itself doesn't need it.
-export async function syncVariantToZoho({
+//
+// Serialized per SKU (Zoho items are matched by SKU) so products/create +
+// products/update + an order webhook seeing the same new variant can't each
+// create their own Zoho item. The mapping is re-read inside the lock and
+// the caller's `mappings` snapshot is updated afterwards.
+export async function syncVariantToZoho(args) {
+  const { shopId, variant, mappings } = args;
+  if (!variant.sku) {
+    return { sku: variant.sku, status: "skipped" };
+  }
+
+  return withResourceLock(resourceLockKey(shopId, "product-sku", variant.sku), async () => {
+    const fresh = await getProductMapping(shopId, variant.id);
+    const freshMappings = { ...(mappings || {}) };
+    if (fresh) freshMappings[variant.id] = { ...(freshMappings[variant.id] || {}), zohoId: fresh.zoho_id, payloadHash: fresh.payload_hash, status: fresh.status };
+    else delete freshMappings[variant.id];
+
+    const result = await syncVariantToZohoUnlocked({ ...args, mappings: freshMappings });
+    if (result.status === "success" && mappings) {
+      mappings[variant.id] = { ...(mappings[variant.id] || {}), zohoId: result.zohoItemId, status: "synced" };
+    }
+    return result;
+  });
+}
+
+async function syncVariantToZohoUnlocked({
   shopId,
   admin,
   zohoAuth,
@@ -206,15 +253,19 @@ export async function syncVariantToZoho({
   mappings,
   inventoryAccountId,
 }) {
-  if (!variant.sku) {
-    return { sku: variant.sku, status: "skipped" };
-  }
 
   const payload = buildZohoItemPayload(product, variant, { inventoryAccountId });
   const existingMapping = mappings[variant.id];
+  // products/update also fires for inventory and metafield changes; skip
+  // the item PUT + status POST + Shopify mutation when nothing we send changed.
+  const hash = payloadHash({ payload, active: product.status === "ACTIVE", parent: product.id || null });
+  if (existingMapping?.zohoId && existingMapping.payloadHash === hash && existingMapping.status === "synced") {
+    return { sku: variant.sku, zohoItemId: existingMapping.zohoId, status: "success", unchanged: true };
+  }
 
   try {
     let zohoItemId = existingMapping?.zohoId;
+    let createdByApp = null;
 
     if (zohoItemId) {
       await updateZohoItem(zohoAuth, zohoItemId, payload);
@@ -225,10 +276,12 @@ export async function syncVariantToZoho({
       });
       if (existingItem) {
         zohoItemId = existingItem.item_id;
+        createdByApp = false;
         await updateZohoItem(zohoAuth, zohoItemId, payload);
       } else {
         const created = await createZohoItem(zohoAuth, payload);
         zohoItemId = created.item_id;
+        createdByApp = true;
       }
     }
 
@@ -237,7 +290,7 @@ export async function syncVariantToZoho({
       zohoItemId,
       product.status === "ACTIVE",
     );
-    await saveProductMapping(shopId, variant.id, zohoItemId, product.id);
+    await saveProductMapping(shopId, variant.id, zohoItemId, product.id, createdByApp, hash);
 
     if (inventoryAccountId) {
       await denyOversellForVariant(admin, product, variant);
@@ -310,6 +363,10 @@ export const PRODUCTS_QUERY = `#graphql
                 inventoryQuantity
               }
             }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
           }
         }
       }
@@ -328,7 +385,53 @@ export function normalizeProductNode(node) {
     ...node,
     imageUrl: node.featuredMedia?.preview?.image?.url || null,
     variants: (node.variants?.edges || []).map(({ node: variant }) => variant),
+    variantsCursor: node.variants?.pageInfo?.hasNextPage ? node.variants.pageInfo.endCursor : null,
   };
+}
+
+// Products can have up to 2048 variants, but PRODUCTS_QUERY only fetches
+// the first 50 inline - page through the rest so bulk sync doesn't
+// silently ignore them.
+const PRODUCT_VARIANTS_QUERY = `#graphql
+  query ProductRemainingVariants($id: ID!, $after: String) {
+    product(id: $id) {
+      variants(first: 250, after: $after) {
+        edges {
+          node {
+            id
+            title
+            sku
+            price
+            inventoryQuantity
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+`;
+
+async function fetchRemainingProductVariants(admin, productId, after) {
+  const variants = [];
+  let cursor = after;
+
+  while (cursor) {
+    const response = await admin.graphql(PRODUCT_VARIANTS_QUERY, {
+      variables: { id: productId, after: cursor },
+    });
+    const json = await response.json();
+    if (json.errors) {
+      throw new Error(`Failed to load variants for ${productId}: ${JSON.stringify(json.errors)}`);
+    }
+    const connection = json.data?.product?.variants;
+    variants.push(...(connection?.edges || []).map(({ node }) => node));
+    cursor = connection?.pageInfo?.hasNextPage ? connection.pageInfo.endCursor : null;
+  }
+
+  return variants;
 }
 
 // The "Sync now"/"Sync everything" actions have to cover the whole catalog
@@ -344,9 +447,19 @@ async function fetchAllProductsForSync(admin) {
       variables: { first: 250, after },
     });
     const json = await response.json();
+    if (json.errors) {
+      throw new Error(`Failed to load Shopify products: ${JSON.stringify(json.errors)}`);
+    }
     const edges = json.data?.products?.edges || [];
 
-    allProducts.push(...edges.map(({ node }) => normalizeProductNode(node)));
+    for (const { node } of edges) {
+      const product = normalizeProductNode(node);
+      if (product.variantsCursor) {
+        product.variants.push(...(await fetchRemainingProductVariants(admin, product.id, product.variantsCursor)));
+        product.variantsCursor = null;
+      }
+      allProducts.push(product);
+    }
 
     const pageInfo = json.data?.products?.pageInfo;
     if (!pageInfo?.hasNextPage) break;
@@ -479,13 +592,18 @@ export async function processProductUpsertWebhook({
       mappings,
       inventoryAccountId: appSettings.accountSettings?.inventoryAccountId,
     });
+    // REST product payloads list at most 100 variants; with more than that
+    // we can't tell a removed variant from an omitted one, so skip cleanup.
+    if (product.variants.length > 0 && product.variants.length < 100) {
+      results.push(...(await retireRemovedVariants({ shopId: shop.id, zohoAuth, product })));
+    }
     const failed = results.filter((result) => result.status === "error");
 
     await finishWebhookLog(logId, {
       status: failed.length > 0 ? "failed" : "processed",
       errorMessage:
         failed.length > 0
-          ? failed.map((result) => `${result.sku}: ${result.error}`).join("; ")
+          ? failed.map((result) => `${result.sku || result.zohoItemId}: ${result.error}`).join("; ")
           : null,
     });
   } catch (error) {
@@ -497,14 +615,43 @@ export async function processProductUpsertWebhook({
   }
 }
 
-// For each Zoho item mapped to this (now-deleted) Shopify product: try a
+// For each Zoho item mapped to this (now-deleted) Shopify product. Items
+// this app did NOT create (linked to a pre-existing Zoho item by SKU, or
+// mapped before that was tracked) belong to the merchant's own catalog, so
+// they are only deactivated, never deleted. Items the app created get a
 // hard delete first, but Zoho refuses to delete an item that's been used
-// in any transaction (invoice, bill, etc.) - so fall back to deactivating
-// it instead, which preserves that transaction history. The mapping row
+// in any transaction (invoice, bill, etc.) - so that falls back to
+// deactivating it, which preserves that transaction history. The mapping row
 // is removed either way (the Shopify side is gone regardless); if BOTH
 // the delete and the deactivate attempt fail, the row is kept with
 // status "error" instead, so the failure stays visible rather than
 // silently vanishing.
+// Retires one variant's Zoho item after the variant (or its whole product)
+// is gone from Shopify. The mapping row is removed either way; if neither
+// delete nor deactivate works it is kept with status "error" so the
+// failure stays visible.
+async function retireZohoItemMapping({ shopId, zohoAuth, mapping }) {
+  if (Number(mapping.created_by_app) === 1) {
+    try {
+      await deleteZohoItem(zohoAuth, mapping.zoho_id);
+      await deleteProductMapping(shopId, mapping.shopify_id);
+      return { zohoItemId: mapping.zoho_id, status: "deleted" };
+    } catch {
+      // Used in a transaction - Zoho won't delete it; deactivate below.
+    }
+  }
+
+  try {
+    await setZohoItemActiveStatus(zohoAuth, mapping.zoho_id, false);
+    await deleteProductMapping(shopId, mapping.shopify_id);
+    return { zohoItemId: mapping.zoho_id, status: "deactivated" };
+  } catch (deactivateError) {
+    console.error("Failed to delete or deactivate Zoho item", mapping.zoho_id, deactivateError);
+    await markProductMappingError(shopId, mapping.shopify_id, deactivateError.message);
+    return { zohoItemId: mapping.zoho_id, status: "error", error: deactivateError.message };
+  }
+}
+
 export async function syncProductDeletionToZoho({
   shopId,
   zohoAuth,
@@ -514,33 +661,24 @@ export async function syncProductDeletionToZoho({
   const results = [];
 
   for (const mapping of mappings) {
-    try {
-      await deleteZohoItem(zohoAuth, mapping.zoho_id);
-      await deleteProductMapping(shopId, mapping.shopify_id);
-      results.push({ zohoItemId: mapping.zoho_id, status: "deleted" });
-    } catch (deleteError) {
-      try {
-        await setZohoItemActiveStatus(zohoAuth, mapping.zoho_id, false);
-        await deleteProductMapping(shopId, mapping.shopify_id);
-        results.push({ zohoItemId: mapping.zoho_id, status: "deactivated" });
-      } catch (deactivateError) {
-        console.error(
-          "Failed to delete or deactivate Zoho item for deleted product",
-          mapping.zoho_id,
-          deactivateError,
-        );
-        await markProductMappingError(
-          shopId,
-          mapping.shopify_id,
-          deactivateError.message,
-        );
-        results.push({
-          zohoItemId: mapping.zoho_id,
-          status: "error",
-          error: deactivateError.message,
-        });
-      }
-    }
+    results.push(await retireZohoItemMapping({ shopId, zohoAuth, mapping }));
+  }
+
+  return results;
+}
+
+// A variant removed from a product arrives as a products/update without
+// that variant - retire its Zoho item the same way a product delete would,
+// instead of leaving it mapped and active forever.
+export async function retireRemovedVariants({ shopId, zohoAuth, product }) {
+  if (!product?.id || !Array.isArray(product.variants)) return [];
+  const currentIds = new Set(product.variants.map((variant) => variant.id));
+  const mappings = await getProductMappingsByParentId(shopId, product.id);
+  const results = [];
+
+  for (const mapping of mappings) {
+    if (currentIds.has(mapping.shopify_id)) continue;
+    results.push(await retireZohoItemMapping({ shopId, zohoAuth, mapping }));
   }
 
   return results;

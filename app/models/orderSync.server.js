@@ -3,6 +3,8 @@ import {
   createZohoSalesOrder,
   updateZohoSalesOrder,
   voidZohoSalesOrder,
+  voidZohoInvoice,
+  fetchZohoInvoice,
 } from "../zoho.server";
 import {
   getConnectionForShopDomain,
@@ -13,6 +15,8 @@ import { syncVariantToZoho, getProductMappings } from "./productSync.server";
 import { syncCustomerToZoho, getCustomerMappings } from "./customerSync.server";
 import { recordWebhookReceived, finishWebhookLog } from "./webhookLog.server";
 import { startSyncLog, finishSyncLog } from "./syncLog.server";
+import { withResourceLock, resourceLockKey } from "./resourceLock.server";
+import { payloadHash } from "./payloadHash.server";
 
 const ENTITY_TYPE = "order";
 
@@ -36,7 +40,7 @@ function describeZohoError(error) {
 
 export async function getOrderMappings(shopId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id, status, last_synced_at, last_error FROM sync_mappings WHERE shop_id = ? AND entity_type = ?`,
+    `SELECT shopify_id, zoho_id, payload_hash, status, last_synced_at, last_error FROM sync_mappings WHERE shop_id = ? AND entity_type = ?`,
     [shopId, ENTITY_TYPE],
   );
 
@@ -44,7 +48,8 @@ export async function getOrderMappings(shopId) {
     rows.map((row) => [
       row.shopify_id,
       {
-        zohoId: row.zoho_id,
+        zohoId: row.zoho_id || null,
+        payloadHash: row.payload_hash || null,
         status: row.status,
         lastSyncedAt: row.last_synced_at,
         lastError: row.last_error,
@@ -55,26 +60,38 @@ export async function getOrderMappings(shopId) {
 
 export async function getOrderMapping(shopId, shopifyOrderId) {
   const [rows] = await db.execute(
-    `SELECT shopify_id, zoho_id FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
+    `SELECT shopify_id, zoho_id, payload_hash, status FROM sync_mappings WHERE shop_id = ? AND entity_type = ? AND shopify_id = ? AND zoho_id <> ''`,
     [shopId, ENTITY_TYPE, shopifyOrderId],
   );
 
   return rows[0] || null;
 }
 
-export async function saveOrderMapping(shopId, shopifyOrderId, zohoSalesOrderId) {
+export async function saveOrderMapping(shopId, shopifyOrderId, zohoSalesOrderId, hash = null) {
   await db.execute(
-    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, zoho_id, status, last_synced_at, last_error)
-     VALUES (?, ?, ?, ?, 'synced', NOW(), NULL)
-     ON DUPLICATE KEY UPDATE zoho_id = VALUES(zoho_id), status = 'synced', last_synced_at = NOW(), last_error = NULL`,
-    [shopId, ENTITY_TYPE, shopifyOrderId, zohoSalesOrderId],
+    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, zoho_id, payload_hash, status, last_synced_at, last_error)
+     VALUES (?, ?, ?, ?, ?, 'synced', NOW(), NULL)
+     ON DUPLICATE KEY UPDATE zoho_id = VALUES(zoho_id), payload_hash = COALESCE(VALUES(payload_hash), payload_hash), status = 'synced', last_synced_at = NOW(), last_error = NULL`,
+    [shopId, ENTITY_TYPE, shopifyOrderId, zohoSalesOrderId, hash],
+  );
+}
+
+// The order changed in Shopify after its Zoho sales order was invoiced -
+// Zoho locks invoiced sales orders (36023), so the change can't be applied.
+// Flagged instead of reported as a successful sync.
+export async function markOrderMappingOutOfSync(shopId, shopifyOrderId, message) {
+  await db.execute(
+    `UPDATE sync_mappings SET status = 'out_of_sync', last_synced_at = NOW(), last_error = ? WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
+    [message, shopId, ENTITY_TYPE, shopifyOrderId],
   );
 }
 
 export async function markOrderMappingError(shopId, shopifyOrderId, errorMessage) {
   await db.execute(
-    `UPDATE sync_mappings SET status = 'error', last_error = ? WHERE shop_id = ? AND entity_type = ? AND shopify_id = ?`,
-    [errorMessage, shopId, ENTITY_TYPE, shopifyOrderId],
+    `INSERT INTO sync_mappings (shop_id, entity_type, shopify_id, zoho_id, status, last_synced_at, last_error)
+       VALUES (?, ?, ?, '', 'error', NOW(), ?)
+       ON DUPLICATE KEY UPDATE status = 'error', last_synced_at = NOW(), last_error = VALUES(last_error)`,
+    [shopId, ENTITY_TYPE, shopifyOrderId, errorMessage],
   );
 }
 
@@ -90,15 +107,21 @@ export async function markOrderMappingVoided(shopId, shopifyOrderId) {
 // account) still carry an email/billing address on the order itself, so a
 // synthetic id ("guest:<email>") is used as the sync_mappings key - this
 // keeps repeat orders from the same guest email linking to the one Zoho
-// contact instead of creating a duplicate every time.
+// contact instead of creating a duplicate every time. Orders with no email
+// (phone-only checkouts, POS walk-in sales) used to be skipped entirely;
+// they now key on the phone number, or share a single "Walk-in customer"
+// contact when there's nothing to identify the buyer at all.
 export function buildOrderCustomer(order) {
   if (order.customer) return order.customer;
 
   const billing = order.billingAddress || {};
-  if (!order.email) return { id: null, email: null };
+  const phone = order.phone || billing.phone || "";
+  if (!order.email && !phone) {
+    return { id: "guest:walk-in", firstName: "Walk-in", lastName: "customer", email: null, phone: "", address: {} };
+  }
 
   return {
-    id: `guest:${order.email}`,
+    id: order.email ? `guest:${order.email}` : `guest-phone:${phone.replace(/\s+/g, "")}`,
     firstName: billing.firstName || "",
     lastName: billing.lastName || "",
     email: order.email,
@@ -182,7 +205,12 @@ export function buildZohoSalesOrderPayload(order, { customerId, lineItems, taxSe
     customer_id: customerId,
     date: formatZohoDate(order.createdAt),
     reference_number: order.name,
-    is_inclusive_tax: Boolean(taxSettings?.pricesIncludeTax),
+    // The order itself knows whether its prices included tax; the Settings
+    // toggle is only a fallback for orders normalized without that flag.
+    is_inclusive_tax:
+      typeof order.taxesIncluded === "boolean"
+        ? order.taxesIncluded
+        : Boolean(taxSettings?.pricesIncludeTax),
     discount: Number(order.totalDiscount) || 0,
     discount_type: "entity_level",
     is_discount_before_tax: taxSettings?.discountBeforeTax !== false,
@@ -196,8 +224,13 @@ export function buildZohoSalesOrderPayload(order, { customerId, lineItems, taxSe
         taxSettings?.defaultTaxId,
       );
 
+      // Lines with no Zoho item (custom items, tips, deleted products,
+      // SKU-less variants) go as free-text lines so the sales order total
+      // still matches Shopify's.
       return {
-        item_id: lineItem.zohoItemId,
+        ...(lineItem.zohoItemId
+          ? { item_id: lineItem.zohoItemId }
+          : { name: lineItem.title || "Item", description: lineItem.title || "" }),
         quantity: lineItem.quantity,
         rate: Number(lineItem.price) || 0,
         ...(taxId ? { tax_id: taxId } : {}),
@@ -210,13 +243,29 @@ export function buildZohoSalesOrderPayload(order, { customerId, lineItems, taxSe
 // variant on the spot (via the exact same syncVariantToZoho used by
 // product sync) if it hasn't been synced yet - an order shouldn't have to
 // wait on someone visiting the Products page first. Line items without a
-// SKU or a real variant (custom/manual line items) are skipped, same as
-// product sync skips variants without a SKU.
+// SKU or a real variant (custom/manual line items, tips, deleted products)
+// have no Zoho item, so they're sent as free-text lines (zohoItemId: null)
+// rather than dropped - dropping them made the sales order, invoice and
+// payment disagree with Shopify's total. A variant whose own sync fails
+// throws instead, so the order is marked failed with the reason rather than
+// silently syncing short.
+export class OrderLineItemError extends Error {}
+
 async function resolveOrderLineItems({ shopId, admin, zohoAuth, order, productMappings, inventoryAccountId }) {
   const resolved = [];
 
   for (const lineItem of order.lineItems) {
-    if (!lineItem.sku || !lineItem.variantId) continue;
+    if (!lineItem.sku || !lineItem.variantId) {
+      if (!(Number(lineItem.quantity) > 0)) continue;
+      resolved.push({
+        zohoItemId: null,
+        title: lineItem.title,
+        quantity: lineItem.quantity,
+        price: lineItem.price,
+        taxLines: lineItem.taxLines,
+      });
+      continue;
+    }
 
     const existingZohoItemId = productMappings[lineItem.variantId]?.zohoId;
 
@@ -235,6 +284,7 @@ async function resolveOrderLineItems({ shopId, admin, zohoAuth, order, productMa
       // Products page already owns keeping name/price accurate.
       resolved.push({
         zohoItemId: existingZohoItemId,
+        title: lineItem.title,
         quantity: lineItem.quantity,
         price: lineItem.price,
         taxLines: lineItem.taxLines,
@@ -265,14 +315,19 @@ async function resolveOrderLineItems({ shopId, admin, zohoAuth, order, productMa
       inventoryAccountId,
     });
 
-    if (result.status === "success") {
-      resolved.push({
-        zohoItemId: result.zohoItemId,
-        quantity: lineItem.quantity,
-        price: lineItem.price,
-        taxLines: lineItem.taxLines,
-      });
+    if (result.status !== "success") {
+      throw new OrderLineItemError(
+        `Line item "${lineItem.title}" (SKU ${lineItem.sku}) could not be synced to Zoho: ${result.error || result.status}`,
+      );
     }
+
+    resolved.push({
+      zohoItemId: result.zohoItemId,
+      title: lineItem.title,
+      quantity: lineItem.quantity,
+      price: lineItem.price,
+      taxLines: lineItem.taxLines,
+    });
   }
 
   return resolved;
@@ -292,7 +347,37 @@ async function resolveOrderLineItems({ shopId, admin, zohoAuth, order, productMa
 // only through an order webhook, never through product sync) doesn't get
 // the policy enforced immediately - it still will next time a product sync
 // touches that variant.
-export async function syncOrderToZoho({
+//
+// Serialized per order: orders/create, orders/paid (via invoice sync) and
+// orders/updated arrive within about a second of each other, and without
+// the lock each would create its own Zoho sales order. The mapping is
+// re-read inside the lock, and the caller's `orderMappings` snapshot is
+// updated so later steps in the same request see the new sales order.
+export async function syncOrderToZoho(args) {
+  const { shopId, order, orderMappings } = args;
+
+  return withResourceLock(resourceLockKey(shopId, ENTITY_TYPE, order.id), async () => {
+    const fresh = await getOrderMapping(shopId, order.id);
+    if (fresh?.status === "voided") {
+      // Cancelled and voided in Zoho - the orders/updated that Shopify sends
+      // with every cancellation (and later "Sync now" runs) must not
+      // resurrect it or overwrite the voided status.
+      return { orderName: order.name, zohoSalesOrderId: fresh.zoho_id, status: "skipped", reason: "order is voided in Zoho" };
+    }
+    const freshMappings = { ...(orderMappings || {}) };
+    if (fresh) {
+      freshMappings[order.id] = { ...(freshMappings[order.id] || {}), zohoId: fresh.zoho_id, payloadHash: fresh.payload_hash, status: fresh.status };
+    } else delete freshMappings[order.id];
+
+    const result = await syncOrderToZohoUnlocked({ ...args, orderMappings: freshMappings });
+    if (result.status === "success" && orderMappings) {
+      orderMappings[order.id] = { ...(orderMappings[order.id] || {}), zohoId: result.zohoSalesOrderId, status: "synced" };
+    }
+    return result;
+  });
+}
+
+async function syncOrderToZohoUnlocked({
   shopId,
   admin,
   zohoAuth,
@@ -304,8 +389,8 @@ export async function syncOrderToZoho({
   inventoryAccountId,
 }) {
   const customer = buildOrderCustomer(order);
-  if (!customer.email) {
-    return { orderName: order.name, status: "skipped" };
+  if (!customer.id && !customer.email) {
+    return { orderName: order.name, status: "skipped", reason: "order has no customer to invoice" };
   }
 
   const customerResult = await syncCustomerToZoho({
@@ -319,16 +404,23 @@ export async function syncOrderToZoho({
     return { orderName: order.name, status: "error", error: `customer: ${customerResult.error}` };
   }
 
-  const lineItems = await resolveOrderLineItems({
-    shopId,
-    admin,
-    zohoAuth,
-    order,
-    productMappings,
-    inventoryAccountId,
-  });
+  let lineItems;
+  try {
+    lineItems = await resolveOrderLineItems({
+      shopId,
+      admin,
+      zohoAuth,
+      order,
+      productMappings,
+      inventoryAccountId,
+    });
+  } catch (error) {
+    if (!(error instanceof OrderLineItemError)) throw error;
+    await markOrderMappingError(shopId, order.id, error.message);
+    return { orderName: order.name, status: "error", error: error.message };
+  }
   if (lineItems.length === 0) {
-    return { orderName: order.name, status: "skipped" };
+    return { orderName: order.name, status: "skipped", reason: "order has no line items" };
   }
 
   const payload = buildZohoSalesOrderPayload(order, {
@@ -337,6 +429,12 @@ export async function syncOrderToZoho({
     taxSettings,
   });
   const existingMapping = orderMappings[order.id];
+  const hash = payloadHash(payload);
+
+  // Nothing changed since the last successful push - skip the Zoho call.
+  if (existingMapping?.zohoId && existingMapping.payloadHash === hash && existingMapping.status === "synced") {
+    return { orderName: order.name, zohoSalesOrderId: existingMapping.zohoId, status: "success", unchanged: true };
+  }
 
   try {
     let zohoSalesOrderId = existingMapping?.zohoId;
@@ -348,7 +446,7 @@ export async function syncOrderToZoho({
       zohoSalesOrderId = created.salesorder_id;
     }
 
-    await saveOrderMapping(shopId, order.id, zohoSalesOrderId);
+    await saveOrderMapping(shopId, order.id, zohoSalesOrderId, hash);
 
     return { orderName: order.name, zohoSalesOrderId, status: "success" };
   } catch (error) {
@@ -356,9 +454,18 @@ export async function syncOrderToZoho({
     // been invoiced (error 36023) - that's an expected terminal state once
     // Section E has run, not a real sync failure, so the existing mapping
     // is left as-is (still "synced") rather than overwritten with "error".
+    // The payload differs from what was last pushed (checked above), so
+    // this is a real edit that Zoho won't take - flag it for the merchant
+    // rather than report success. A mapping without a stored hash predates
+    // change tracking; adopt the current payload as the baseline instead.
     if (existingMapping?.zohoId && error.details?.code === 36023) {
-      await saveOrderMapping(shopId, order.id, existingMapping.zohoId);
-      return { orderName: order.name, zohoSalesOrderId: existingMapping.zohoId, status: "success" };
+      if (!existingMapping.payloadHash) {
+        await saveOrderMapping(shopId, order.id, existingMapping.zohoId, hash);
+        return { orderName: order.name, zohoSalesOrderId: existingMapping.zohoId, status: "success" };
+      }
+      const message = "Order changed in Shopify after it was invoiced in Zoho; Zoho locks invoiced sales orders, so update the invoice in Zoho manually.";
+      await markOrderMappingOutOfSync(shopId, order.id, message);
+      return { orderName: order.name, zohoSalesOrderId: existingMapping.zohoId, status: "warning", error: message };
     }
 
     // Zoho rejects a `tax_id` on ANY line item, org-wide, if GST hasn't been
@@ -389,7 +496,7 @@ export async function syncOrderToZoho({
           zohoSalesOrderId = created.salesorder_id;
         }
 
-        await saveOrderMapping(shopId, order.id, zohoSalesOrderId);
+        await saveOrderMapping(shopId, order.id, zohoSalesOrderId, hash);
 
         return { orderName: order.name, zohoSalesOrderId, status: "success" };
       } catch (retryError) {
@@ -420,10 +527,17 @@ export const ORDERS_QUERY = `#graphql
           name
           createdAt
           updatedAt
+          processedAt
+          taxesIncluded
           email
           phone
           displayFinancialStatus
           totalPriceSet {
+            shopMoney {
+              amount
+            }
+          }
+          totalReceivedSet {
             shopMoney {
               amount
             }
@@ -479,6 +593,10 @@ export const ORDERS_QUERY = `#graphql
                 }
               }
             }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
           }
           totalDiscountsSet {
             shopMoney {
@@ -512,6 +630,79 @@ export const ORDERS_QUERY = `#graphql
   }
 `;
 
+// Follow-up for orders with more than the 50 line items ORDERS_QUERY
+// fetches inline - without it, lines past 50 were silently dropped and the
+// Zoho sales order came out short.
+const ORDER_LINE_ITEMS_QUERY = `#graphql
+  query OrderRemainingLineItems($id: ID!, $after: String) {
+    order(id: $id) {
+      lineItems(first: 100, after: $after) {
+        edges {
+          node {
+            title
+            sku
+            quantity
+            variant {
+              id
+              product {
+                id
+              }
+            }
+            originalUnitPriceSet {
+              shopMoney {
+                amount
+              }
+            }
+            taxLines {
+              title
+              rate
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+`;
+
+function normalizeOrderLineItemNode(lineItem) {
+  return {
+    variantId: lineItem.variant?.id || null,
+    productId: lineItem.variant?.product?.id || null,
+    sku: lineItem.sku,
+    title: lineItem.title,
+    quantity: lineItem.quantity,
+    price: lineItem.originalUnitPriceSet?.shopMoney?.amount,
+    taxLines: (lineItem.taxLines || []).map((line) => ({
+      title: line.title,
+      rate: Number(line.rate) || 0,
+    })),
+  };
+}
+
+async function fetchRemainingOrderLineItems(admin, orderId, after) {
+  const lineItems = [];
+  let cursor = after;
+
+  while (cursor) {
+    const response = await admin.graphql(ORDER_LINE_ITEMS_QUERY, {
+      variables: { id: orderId, after: cursor },
+    });
+    const json = await response.json();
+    if (json.errors) {
+      throw new Error(`Failed to load line items for ${orderId}: ${JSON.stringify(json.errors)}`);
+    }
+    const connection = json.data?.order?.lineItems;
+    lineItems.push(...(connection?.edges || []).map(({ node }) => normalizeOrderLineItemNode(node)));
+    cursor = connection?.pageInfo?.hasNextPage ? connection.pageInfo.endCursor : null;
+  }
+
+  return lineItems;
+}
+
 export function normalizeOrderNode(node) {
   const address = node.customer?.defaultAddress || {};
 
@@ -520,10 +711,13 @@ export function normalizeOrderNode(node) {
     name: node.name,
     createdAt: node.createdAt,
     updatedAt: node.updatedAt,
+    processedAt: node.processedAt || null,
+    taxesIncluded: typeof node.taxesIncluded === "boolean" ? node.taxesIncluded : undefined,
     email: node.email || null,
     phone: node.phone || null,
     financialStatus: node.displayFinancialStatus || null,
     totalPrice: node.totalPriceSet?.shopMoney?.amount,
+    totalReceived: node.totalReceivedSet?.shopMoney?.amount ?? null,
     paymentGatewayNames: node.paymentGatewayNames || [],
     customer: node.customer
       ? {
@@ -554,18 +748,8 @@ export function normalizeOrderNode(node) {
       country: node.billingAddress?.country || "",
       phone: node.billingAddress?.phone || "",
     },
-    lineItems: (node.lineItems?.edges || []).map(({ node: lineItem }) => ({
-      variantId: lineItem.variant?.id || null,
-      productId: lineItem.variant?.product?.id || null,
-      sku: lineItem.sku,
-      title: lineItem.title,
-      quantity: lineItem.quantity,
-      price: lineItem.originalUnitPriceSet?.shopMoney?.amount,
-      taxLines: (lineItem.taxLines || []).map((line) => ({
-        title: line.title,
-        rate: Number(line.rate) || 0,
-      })),
-    })),
+    lineItems: (node.lineItems?.edges || []).map(({ node: lineItem }) => normalizeOrderLineItemNode(lineItem)),
+    lineItemsCursor: node.lineItems?.pageInfo?.hasNextPage ? node.lineItems.pageInfo.endCursor : null,
     totalDiscount: node.totalDiscountsSet?.shopMoney?.amount,
     totalShipping: node.totalShippingPriceSet?.shopMoney?.amount,
     shippingMethod: node.shippingLine?.title || null,
@@ -640,9 +824,21 @@ export async function fetchAllOrdersForSync(admin) {
       variables: { first: 250, after },
     });
     const json = await response.json();
+    // Returning a partial list here would make "Sync now" and payment
+    // reconciliation silently skip orders, so surface the failure instead.
+    if (json.errors) {
+      throw new Error(`Failed to load Shopify orders: ${JSON.stringify(json.errors)}`);
+    }
     const edges = json.data?.orders?.edges || [];
 
-    allOrders.push(...edges.map(({ node }) => normalizeOrderNode(node)));
+    for (const { node } of edges) {
+      const order = normalizeOrderNode(node);
+      if (order.lineItemsCursor) {
+        order.lineItems.push(...(await fetchRemainingOrderLineItems(admin, order.id, order.lineItemsCursor)));
+        order.lineItemsCursor = null;
+      }
+      allOrders.push(order);
+    }
 
     const pageInfo = json.data?.orders?.pageInfo;
     if (!pageInfo?.hasNextPage) break;
@@ -728,7 +924,11 @@ export async function runOrderSync({ admin, shop, zohoAuth }) {
   });
 
   const freshOrderMappings = await getOrderMappings(shop.id);
-  const paidOrders = orders.filter((order) => order.financialStatus === "PAID");
+  // Every order money was collected on - refunds are recorded separately
+  // as credit notes, so a (partially) refunded order still needs its
+  // original invoice and payment.
+  const BACKFILL_STATUSES = new Set(["PAID", "PARTIALLY_PAID", "PARTIALLY_REFUNDED", "REFUNDED"]);
+  const paidOrders = orders.filter((order) => BACKFILL_STATUSES.has(order.financialStatus));
 
   const invoiceResults = [];
   const paymentResults = [];
@@ -784,9 +984,17 @@ export function normalizeRestOrder(payload) {
     name: payload.name,
     createdAt: payload.created_at,
     updatedAt: payload.updated_at || payload.created_at,
+    processedAt: payload.processed_at || null,
+    taxesIncluded: typeof payload.taxes_included === "boolean" ? payload.taxes_included : undefined,
     email: payload.email || payload.contact_email || null,
     phone: payload.phone || null,
     totalPrice: payload.total_price,
+    // Money actually collected so far (orders/paid is fully paid, but a
+    // partially paid order has an outstanding balance).
+    totalReceived:
+      payload.total_outstanding != null
+        ? Math.max(0, (Number(payload.total_price) || 0) - (Number(payload.total_outstanding) || 0))
+        : null,
     paymentGatewayNames: payload.payment_gateway_names || [],
     customer: payload.customer
       ? {
@@ -907,7 +1115,7 @@ export async function processOrderUpsertWebhook({
 
     await finishWebhookLog(logId, {
       status: result.status === "error" ? "failed" : "processed",
-      errorMessage: result.status === "error" ? result.error : null,
+      errorMessage: result.status === "error" || result.status === "warning" ? result.error : result.reason || null,
     });
   } catch (error) {
     console.error("Failed to process order webhook", topic, error);
@@ -923,11 +1131,38 @@ export async function processOrderUpsertWebhook({
 // purposes while marking it inactive. The mapping row is kept (status
 // "voided") rather than removed, unlike product/customer deletion, since
 // the Shopify order itself still exists.
+//
+// A cancelled order is usually already invoiced, and Zoho won't void a sales
+// order with an invoice on it. An unpaid invoice is voided first; a paid one
+// can't be voided - the money side is recorded by the refunds/create webhook
+// as a credit note - so the order is flagged instead of reported as failed.
 export async function syncOrderCancellationToZoho({ shopId, zohoAuth, shopifyOrderId }) {
   const mapping = await getOrderMapping(shopId, shopifyOrderId);
   if (!mapping) return { status: "skipped" };
+  if (mapping.status === "voided") return { zohoSalesOrderId: mapping.zoho_id, status: "skipped", reason: "already voided" };
 
+  return withResourceLock(resourceLockKey(shopId, ENTITY_TYPE, shopifyOrderId), () =>
+    voidOrderInZoho({ shopId, zohoAuth, shopifyOrderId, mapping }),
+  );
+}
+
+async function voidOrderInZoho({ shopId, zohoAuth, shopifyOrderId, mapping }) {
   try {
+    // Lazy import: invoiceSync.server.js imports this module.
+    const { getInvoiceMapping } = await import("./invoiceSync.server");
+    const invoiceMapping = await getInvoiceMapping(shopId, shopifyOrderId);
+    if (invoiceMapping?.zoho_id) {
+      const invoice = await fetchZohoInvoice(zohoAuth, invoiceMapping.zoho_id);
+      const status = String(invoice?.status || "").toLowerCase();
+      const paidSomething = Number(invoice?.balance) < Number(invoice?.total) - 0.01;
+      if (status !== "void" && paidSomething) {
+        const message = "Cancelled in Shopify after payment - the Zoho invoice stays; the Shopify refund is recorded as a credit note.";
+        await markOrderMappingOutOfSync(shopId, shopifyOrderId, message);
+        return { zohoSalesOrderId: mapping.zoho_id, status: "skipped", reason: message };
+      }
+      if (status !== "void") await voidZohoInvoice(zohoAuth, invoiceMapping.zoho_id);
+    }
+
     await voidZohoSalesOrder(zohoAuth, mapping.zoho_id);
     await markOrderMappingVoided(shopId, shopifyOrderId);
     return { zohoSalesOrderId: mapping.zoho_id, status: "voided" };
