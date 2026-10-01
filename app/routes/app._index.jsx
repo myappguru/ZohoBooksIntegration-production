@@ -1,5 +1,5 @@
 import { boundary } from "@shopify/shopify-app-react-router/server";
-import { Form, useLoaderData, useNavigation } from "react-router";
+import { Form, Link, useLoaderData, useNavigation } from "react-router";
 import { authenticate } from "../shopify.server";
 import { useRevalidateWhileRunning } from "../hooks/useRevalidateWhileRunning";
 import { getConnectionForShopDomain, getValidAccessToken } from "../models/zohoConnection.server";
@@ -199,18 +199,18 @@ export default function Index() {
         <div className="two-column">
           <div className="panel"><div className="panel-header"><h2 className="panel-title">Sync Overview</h2><p className="panel-subtitle">Latest synchronization success by data type</p></div>
             {logs.map((item) => { const rate = getSuccessRate(item.log) ?? (item.count > 0 ? 100 : 0); return <div className="sync-row" key={item.key}><div className="sync-label"><span className="sync-dot"></span><s-icon type={item.iconType} tone={item.tone}></s-icon>{item.label.replace(" Items", "")}</div><div className="progress-track"><div className="progress-fill" style={{ width: `${rate}%` }}></div></div><div className="progress-value">{rate}%</div><div className="progress-count">{formatCount(item.count)} synced</div></div>; })}
-            <div className="history-footer"><a href="/app/sync-history">View detailed sync history →</a></div>
+            <div className="history-footer"><Link to="/app/sync-history">View detailed sync history →</Link></div>
           </div>
 
           <div className="panel"><div className="panel-header"><h2 className="panel-title">Recent Activity</h2><p className="panel-subtitle">Latest synchronization activities</p></div>
             <div className="activity-list">{hasActivity ? logs.filter((item) => item.log).map((item) => { const failed = Number(item.log.records_failed || 0) > 0; return <div className="activity-row" key={item.key}><span className="activity-icon">✓</span><div><div className="activity-title">{item.label.replace(" Items", "")} sync {failed ? "partially completed" : "completed"}</div><div className="activity-meta">{formatCount(item.log.records_processed)} records processed · {formatCount(item.log.records_success)} succeeded</div></div><span className={`status-pill ${failed ? "status-partial" : ""}`}>{failed ? "Partial" : "Success"}</span><span className="activity-time">{formatDate(item.log.completed_at || item.log.started_at)}</span></div>; }) : <div className="empty-state">No synchronization activity yet.</div>}</div>
-            <div className="history-footer"><a href="/app/sync-history">View all activities →</a></div>
+            <div className="history-footer"><Link to="/app/sync-history">View all activities →</Link></div>
           </div>
         </div>
 
         <div className="panel"><div className="panel-header"><h2 className="panel-title">Recent Sync History</h2><p className="panel-subtitle">Summary of recent synchronization operations</p></div>
-          {hasActivity ? <table className="history-table"><thead><tr><th>Type</th><th>Records</th><th>Status</th><th>Date &amp; Time</th><th>Duration</th><th>Details</th></tr></thead><tbody>{logs.filter((item) => item.log).map((item) => { const failed = Number(item.log.records_failed || 0) > 0; return <tr key={item.key}><td><span className="history-type"><s-icon type={item.iconType} tone={item.tone}></s-icon>{item.label.replace(" Items", "")}</span></td><td>{formatCount(item.log.records_processed)}</td><td><span className={`status-pill ${failed ? "status-partial" : ""}`}>{failed ? "Partial" : "Success"}</span></td><td>{formatDate(item.log.completed_at || item.log.started_at)}</td><td>{formatDuration(item.log)}</td><td><a className="details-link" href="/app/sync-history">View details</a></td></tr>; })}</tbody></table> : <div className="empty-state">Your recent sync operations will appear here.</div>}
-          <div className="history-footer"><a href="/app/sync-history">View full sync history →</a></div>
+          {hasActivity ? <table className="history-table"><thead><tr><th>Type</th><th>Records</th><th>Status</th><th>Date &amp; Time</th><th>Duration</th><th>Details</th></tr></thead><tbody>{logs.filter((item) => item.log).map((item) => { const failed = Number(item.log.records_failed || 0) > 0; return <tr key={item.key}><td><span className="history-type"><s-icon type={item.iconType} tone={item.tone}></s-icon>{item.label.replace(" Items", "")}</span></td><td>{formatCount(item.log.records_processed)}</td><td><span className={`status-pill ${failed ? "status-partial" : ""}`}>{failed ? "Partial" : "Success"}</span></td><td>{formatDate(item.log.completed_at || item.log.started_at)}</td><td>{formatDuration(item.log)}</td><td><Link className="details-link" to="/app/sync-history">View details</Link></td></tr>; })}</tbody></table> : <div className="empty-state">Your recent sync operations will appear here.</div>}
+          <div className="history-footer"><Link to="/app/sync-history">View full sync history →</Link></div>
         </div>
 
         <OtherApps />
