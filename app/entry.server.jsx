@@ -5,11 +5,17 @@ import { createReadableStreamFromReadable } from "@react-router/node";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
 import { addStaleCacheClearHeaders } from "./utils/staleCache.server";
-import { startWebhookRetryLoop } from "./models/webhookQueue.server";
+import { startWebhookRetryLoop, stopWebhookRetryLoop } from "./models/webhookQueue.server";
 import { failInterruptedSyncLogs } from "./models/syncJobs.server";
+import { installShutdownHandlers } from "./utils/gracefulShutdown.server";
 
 // Replays failed webhook deliveries in the background (see webhookQueue.server.js).
 startWebhookRetryLoop();
+// Make a plain `kill` actually stop the process (see gracefulShutdown.server.js).
+if (!globalThis.__zohoShutdownHandlersInstalled) {
+  globalThis.__zohoShutdownHandlersInstalled = true;
+  installShutdownHandlers({ stopBackgroundWork: stopWebhookRetryLoop });
+}
 // Sync runs left "running" by a previous process can never finish now.
 if (!globalThis.__zohoSyncLogsRecovered) {
   globalThis.__zohoSyncLogsRecovered = true;

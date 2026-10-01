@@ -174,5 +174,13 @@ export function startWebhookRetryLoop() {
   };
   globalThis.__zohoWebhookRetryLoop = setInterval(run, SWEEP_INTERVAL_MS);
   globalThis.__zohoWebhookRetryLoop.unref?.();
-  setTimeout(run, 30 * 1000).unref?.();
+  globalThis.__zohoWebhookRetryKickoff = setTimeout(run, 30 * 1000);
+  globalThis.__zohoWebhookRetryKickoff.unref?.();
+}
+
+export function stopWebhookRetryLoop() {
+  clearInterval(globalThis.__zohoWebhookRetryLoop);
+  clearTimeout(globalThis.__zohoWebhookRetryKickoff);
+  globalThis.__zohoWebhookRetryLoop = null;
+  globalThis.__zohoWebhookRetryKickoff = null;
 }
