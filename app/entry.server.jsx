@@ -4,6 +4,7 @@ import { ServerRouter } from "react-router";
 import { createReadableStreamFromReadable } from "@react-router/node";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
+import { addStaleCacheClearHeaders } from "./utils/staleCache.server";
 import { startWebhookRetryLoop } from "./models/webhookQueue.server";
 import { failInterruptedSyncLogs } from "./models/syncJobs.server";
 
@@ -24,6 +25,7 @@ export default async function handleRequest(
   reactRouterContext,
 ) {
   addDocumentResponseHeaders(request, responseHeaders);
+  addStaleCacheClearHeaders(request, responseHeaders);
   const userAgent = request.headers.get("user-agent");
   const callbackName = isbot(userAgent ?? "") ? "onAllReady" : "onShellReady";
 
