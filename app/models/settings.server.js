@@ -2,7 +2,7 @@ import { authenticate } from "../shopify.server";
 import { getConnectionForShopDomain, disconnect, getValidAccessToken } from "./zohoConnection.server";
 import { getAppSettings, mergeAppSettings } from "./appSettings.server";
 import { getWarehouseMappings, saveWarehouseMapping, removeWarehouseMapping } from "./warehouseMapping.server";
-import { getAuthorizationUrl, fetchOrganizationDetails, fetchWarehouses, fetchTaxes, fetchChartOfAccounts } from "../zoho.server";
+import { fetchOrganizationDetails, fetchWarehouses, fetchTaxes, fetchChartOfAccounts } from "../zoho.server";
 import { detectShopifyTaxRates } from "./orderSync.server";
 
 const LOCATIONS_QUERY = `#graphql
@@ -86,7 +86,7 @@ export const loader = async ({ request }) => {
     warehouses: warehousesResult.items, warehouseMappings, warehouseSyncError: warehousesResult.error,
     taxes: taxesResult.items, taxSyncError: taxesResult.error, taxSettings, taxRateRows, taxRates: taxRateRows,
     accounts: accountsResult.items, accountSyncError: accountsResult.error,
-    accountSettings, zohoAuthUrl: getAuthorizationUrl(session.shop),
+    accountSettings,
   };
 };
 

@@ -1,5 +1,6 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { useFetcher, useRevalidator } from "react-router";
+import { openZohoAuthPopup } from "../utils/zohoAuthPopup";
 
 function toast(message, isError = false) {
   try {
@@ -27,6 +28,24 @@ export function useZohoConnectionSync() {
       toast(connectFetcher.data.error || "Failed to connect Zoho Books", true);
     }
   }, [connectFetcher.state, connectFetcher.data]);
+
+  // A page loaded before the merchant connected (or disconnected) somewhere
+  // else - another tab, or Settings while the dashboard sat in the
+  // background - would otherwise keep showing the old status until a reload.
+  useEffect(() => {
+    function handleVisibilityChange() {
+      if (document.visibilityState !== "visible") return;
+      if (revalidatorRef.current.state !== "idle") return;
+      revalidatorRef.current.revalidate();
+    }
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, []);
+
+  const connectZoho = useCallback(async () => {
+    const result = await openZohoAuthPopup();
+    if (!result.ok) toast(result.error, true);
+  }, []);
 
   useEffect(() => {
     function handleMessage(event) {
@@ -189,4 +208,6 @@ export function useZohoConnectionSync() {
       style?.remove();
     };
   }, []);
+
+  return { connectZoho };
 }

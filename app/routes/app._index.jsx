@@ -3,7 +3,6 @@ import { Form, useLoaderData, useNavigation } from "react-router";
 import { authenticate } from "../shopify.server";
 import { useRevalidateWhileRunning } from "../hooks/useRevalidateWhileRunning";
 import { getConnectionForShopDomain, getValidAccessToken } from "../models/zohoConnection.server";
-import { getAuthorizationUrl } from "../zoho.server";
 import { getSyncedProductCount, runProductSync } from "../models/productSync.server";
 import { getSyncedCustomerCount, runCustomerSync } from "../models/customerSync.server";
 import { getSyncedOrderCount, runOrderSync } from "../models/orderSync.server";
@@ -42,7 +41,6 @@ export const loader = async ({ request }) => {
     zohoConnected: Boolean(connection),
     zohoNeedsReauth: Boolean(connection?.needs_reauth),
     zohoOrganizationName: connection?.organization_name || null,
-    zohoAuthUrl: connection && !connection.needs_reauth ? null : getAuthorizationUrl(session.shop),
     syncCounts: { products: productCount, customers: customerCount, orders: orderCount, inventory: inventoryCount },
     recentLogs: { products: productLog, customers: customerLog, orders: orderLog, inventory: inventoryLog },
   };
@@ -70,9 +68,6 @@ export const action = async ({ request }) => {
   return { ok: true, started: job.started, message: job.started ? "Sync started. Results appear here as each step finishes." : "A sync is already running." };
 };
 
-function openZohoAuthWindow(zohoAuthUrl) {
-  window.open(zohoAuthUrl, "zoho-connect", "width=600,height=720");
-}
 function formatCount(value) { return new Intl.NumberFormat().format(value || 0); }
 function formatDate(value) {
   if (!value) return "—";
@@ -99,9 +94,9 @@ function formatDuration(log) {
 }
 
 export default function Index() {
-  const { zohoConnected, zohoNeedsReauth, zohoOrganizationName, zohoAuthUrl, syncCounts, recentLogs } = useLoaderData();
+  const { zohoConnected, zohoNeedsReauth, zohoOrganizationName, syncCounts, recentLogs } = useLoaderData();
   useRevalidateWhileRunning(Object.values(recentLogs || {}));
-  useZohoConnectionSync();
+  const { connectZoho } = useZohoConnectionSync();
   const navigation = useNavigation();
   const isRefreshing = navigation.state === "loading";
   const isSyncingAll = navigation.state === "submitting" && navigation.formData?.get("intent") === "sync-all";
@@ -198,7 +193,7 @@ export default function Index() {
         <div className="connection-card">
           <div className="connection-side"><div className="connection-logo"><s-icon type="store" tone="success"></s-icon></div><div><div className="connection-name">Shopify</div><div className="connection-caption">Store connected and ready to sync</div></div></div>
           <div className="connection-center"><span className="connection-line"></span><span className="connected-pill"><span className="connected-dot"></span>{zohoNeedsReauth ? "Reconnect Zoho" : zohoConnected ? "Connected" : "Zoho not connected"}</span><span className="connection-line"></span></div>
-          <div className="connection-side right"><div className="connection-right"><strong>{zohoConnected ? "Zoho Books" : "Connect Zoho Books"}</strong><span>{zohoNeedsReauth ? "Zoho access expired or was revoked - reconnect to resume syncing" : zohoConnected ? (zohoOrganizationName || "Organization connected") : "Authorize your Zoho organization to enable sync"}</span>{(!zohoConnected || zohoNeedsReauth) && <div style={{ marginTop: 6 }}><s-button variant="primary" onClick={() => openZohoAuthWindow(zohoAuthUrl)}>{zohoNeedsReauth ? "Reconnect" : "Connect"}</s-button></div>}</div><div className="connection-logo zoho"><s-icon type="link" tone={zohoConnected ? "info" : "caution"}></s-icon></div></div>
+          <div className="connection-side right"><div className="connection-right"><strong>{zohoConnected ? "Zoho Books" : "Connect Zoho Books"}</strong><span>{zohoNeedsReauth ? "Zoho access expired or was revoked - reconnect to resume syncing" : zohoConnected ? (zohoOrganizationName || "Organization connected") : "Authorize your Zoho organization to enable sync"}</span>{(!zohoConnected || zohoNeedsReauth) && <div style={{ marginTop: 6 }}><s-button variant="primary" onClick={connectZoho}>{zohoNeedsReauth ? "Reconnect" : "Connect"}</s-button></div>}</div><div className="connection-logo zoho"><s-icon type="link" tone={zohoConnected ? "info" : "caution"}></s-icon></div></div>
         </div>
 
         <div className="two-column">
